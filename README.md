@@ -2,7 +2,7 @@
 
 Handheld **Wi-Fi and Bluetooth Low Energy scanning, signal tracking, and known-device finding** for the LilyGO T-Embed CC1101. Navigate with the rotary encoder, follow signals on the display, and use the eight-light ring and speaker for visual and audio guidance.
 
-**Branch:** `t-embed-cc1101` · **Current firmware:** `v1.1.0-cc1101.15` · **Status:** test build
+**Branch:** `t-embed-cc1101` · **Current firmware:** `v1.1.0-cc1101.16` · **Status:** test build
 
 This branch builds on [ATOMNFT/Rogue-Radar](https://github.com/ATOMNFT/Rogue-Radar), with board support and features developed for the T-Embed CC1101. The tools described below use the ESP32-S3's 2.4 GHz Wi-Fi and BLE radios. Sub-GHz scanning/transmitting through the CC1101 radio is not implemented.
 
@@ -178,6 +178,7 @@ See [FEATURE_PLAN.md](FEATURE_PLAN.md#validation-status) for the detailed featur
 
 | Version | Status | Changes |
 |---|---|---|
+| v1.1.0-cc1101.16 | CC1101 test build | Fixes a stale UI reference when saving, tracking, or associating a device from Nearby Signals details, including later result pages |
 | v1.1.0-cc1101.15 | CC1101 test build | Makes navigation selection outlines bright yellow and fully opaque across all pages, including scanner controls, Nearby Signals, tracking, and keyboard selection |
 | v1.1.0-cc1101.14 | CC1101 test build | Adds display-memory headroom and reduces crowded-list redraw and SD lookup work; adds bounded Flock observation queues, current Wi-Fi/BLE signatures, confidence labels, and receiver-aware signal reporting; adds USB runtime health statistics |
 | v1.1.0-cc1101.13 | CC1101 test build | Keeps strong and weak RSSI history visible in Nearby Signals and Track Signal with full-range chart scales and bounded plotting |

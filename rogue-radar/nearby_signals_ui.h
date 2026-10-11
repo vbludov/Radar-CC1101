@@ -159,6 +159,11 @@ static void deleteGroup() {
 static void prepareScreen(const char *title) {
     deleteGroup();
     lv_obj_clean(state.screen);
+    // Every child of the previous view has just been deleted. In particular,
+    // Detail has no status label: stop/save callbacks must not reuse List's.
+    state.status = nullptr;
+    state.captureButton = nullptr;
+    state.nextPhaseButton = nullptr;
     applyScreenStyle(state.screen);
     createHeader(state.screen, title);
     state.group = lv_group_create();

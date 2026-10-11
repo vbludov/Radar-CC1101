@@ -72,6 +72,13 @@ echo "PASS original cancel recreation reproduced allocator failure (exit $old_st
 "$tmp_dir/known_devices_ui_test"
 
 "${CXX:-g++}" -std=c++11 -O0 -Wall -Wextra -Werror \
+    -I"$tmp_dir" -I"$lvgl_dir" -I"$repo_root/tests/radio_stubs" \
+    -DLV_CONF_INCLUDE_SIMPLE \
+    "$repo_root/tests/nearby_signals_ui_test.cpp" \
+    "$tmp_dir/liblvgl.a" -lm -o "$tmp_dir/nearby_signals_ui_test"
+"$tmp_dir/nearby_signals_ui_test"
+
+"${CXX:-g++}" -std=c++11 -O0 -Wall -Wextra -Werror \
     -I"$tmp_dir" -I"$lvgl_dir" -DLV_CONF_INCLUDE_SIMPLE \
     "$repo_root/tests/lvgl_hybrid_pool_test.cpp" \
     "$tmp_dir/liblvgl.a" -lm -o "$tmp_dir/lvgl_hybrid_pool_test"
