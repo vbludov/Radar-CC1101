@@ -93,6 +93,7 @@ using FlockQueue = rogue_radar::FlockObservationQueue<16>;
 #include <esp_wifi.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
+#include "selection_outline.h"
 #include "deferred_screen_delete.h"
 #include <RotaryEncoder.h>
 #include "board_leds.h"
@@ -2749,19 +2750,19 @@ static void styleListBtn(lv_obj_t *btn) {
     // Focused row style
     lv_obj_set_style_bg_color(btn,   TC(btnFocus), LV_PART_MAIN | LV_STATE_FOCUSED);
     lv_obj_set_style_bg_opa(btn,     LV_OPA_COVER, LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_color(btn, TC(accent), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(btn, lv_color_hex(0xFFFF00), LV_PART_MAIN | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(btn, 1,           LV_PART_MAIN | LV_STATE_FOCUSED);
 
     // Encoder/key focus state — helps override LVGL's default blue focus bar
     lv_obj_set_style_bg_color(btn,   TC(btnFocus), LV_PART_MAIN | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_bg_opa(btn,     LV_OPA_COVER, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
-    lv_obj_set_style_border_color(btn, TC(accent), LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_color(btn, lv_color_hex(0xFFFF00), LV_PART_MAIN | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_border_width(btn, 1,           LV_PART_MAIN | LV_STATE_FOCUS_KEY);
 
     // Extra-specific focused + key-focused state
     lv_obj_set_style_bg_color(btn,   TC(btnFocus), LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_bg_opa(btn,     LV_OPA_COVER, LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
-    lv_obj_set_style_border_color(btn, TC(accent), LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_color(btn, lv_color_hex(0xFFFF00), LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_border_width(btn, 1,           LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
 
     // Pressed/selected style
@@ -5770,9 +5771,9 @@ void createSoundRecorder() {
     lv_obj_set_scroll_dir(recordPanel, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(recordPanel, LV_SCROLLBAR_MODE_AUTO);
     // Focus styling makes it obvious when the left scroll panel is selected.
-    lv_obj_set_style_border_color(recordPanel, TC(accent), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(recordPanel, lv_color_hex(0xFFFF00), LV_PART_MAIN | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(recordPanel, 2, LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_color(recordPanel, TC(accent), LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_color(recordPanel, lv_color_hex(0xFFFF00), LV_PART_MAIN | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_border_width(recordPanel, 2, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
 
     lv_obj_t *recordTitle = lv_label_create(recordPanel);
@@ -5817,9 +5818,9 @@ void createSoundRecorder() {
     lv_obj_set_scroll_dir(filesPanel, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(filesPanel, LV_SCROLLBAR_MODE_AUTO);
     // Focus styling makes it obvious when the right scroll panel is selected.
-    lv_obj_set_style_border_color(filesPanel, TC(accent), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(filesPanel, lv_color_hex(0xFFFF00), LV_PART_MAIN | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(filesPanel, 2, LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_color(filesPanel, TC(accent), LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_border_color(filesPanel, lv_color_hex(0xFFFF00), LV_PART_MAIN | LV_STATE_FOCUS_KEY);
     lv_obj_set_style_border_width(filesPanel, 2, LV_PART_MAIN | LV_STATE_FOCUS_KEY);
 
     lv_obj_t *filesTitle = lv_label_create(filesPanel);
@@ -15001,7 +15002,7 @@ void createSmartChargerDetail(int idx) {
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_scroll_dir(card, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_set_style_border_color(card, lv_color_hex(TH.accent), LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(card, lv_color_hex(0xFFFF00), LV_PART_MAIN | LV_STATE_FOCUSED);
     lv_obj_set_style_border_width(card, 2, LV_PART_MAIN | LV_STATE_FOCUSED);
 
     uint32_t ageSec = (millis() - chargerEntries[idx].lastSeen) / 1000;
@@ -16104,6 +16105,7 @@ void setup() {
     });
 
     lvDisp = lv_display_create(SCREEN_W, SCREEN_H);
+    selection_outline::install(lvDisp);
     lv_display_set_flush_cb(lvDisp, lvgl_flush_cb);
     lv_display_set_buffers(lvDisp, lvBuf1, lvBuf2,
                            sizeof(lvBuf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
