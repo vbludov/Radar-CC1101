@@ -2,7 +2,7 @@
 
 Handheld **Wi-Fi and Bluetooth Low Energy scanning, signal tracking, and known-device finding** for the LilyGO T-Embed CC1101. Navigate with the rotary encoder, follow signals on the display, and use the eight-light ring and speaker for visual and audio guidance.
 
-**Branch:** `t-embed-cc1101` · **Current firmware:** `v1.1.0-cc1101.13` · **Status:** test build
+**Branch:** `t-embed-cc1101` · **Current firmware:** `v1.1.0-cc1101.14` · **Status:** test build
 
 This branch builds on [ATOMNFT/Rogue-Radar](https://github.com/ATOMNFT/Rogue-Radar), with board support and features developed for the T-Embed CC1101. The tools described below use the ESP32-S3's 2.4 GHz Wi-Fi and BLE radios. Sub-GHz scanning/transmitting through the CC1101 radio is not implemented.
 
@@ -74,8 +74,10 @@ BLE addresses can rotate, and names or advertisement contents can be shared by u
 | **WiFi Mapper** | Displays nearby access-point signals with RSSI scaling and speed presets. |
 | **PineAP Hunter** | Watches for BSSIDs cycling through many SSIDs across scans. |
 | **Pwnagotchi Watch** | Looks for matching beacon behavior and displays advertised status and device details. |
-| **Flock Detector** | Flags Wi-Fi patterns associated with Flock-style devices and shows match details. |
-| **Flock Hybrid** | Alternates BLE and Wi-Fi detection phases and combines their results in one view. |
+| **Flock Detector** | Passively checks Wi-Fi transmitter/receiver addresses, probe fingerprints, and SSID patterns; shows the evidence and its confidence. |
+| **Flock Hybrid** | Alternates BLE and Wi-Fi phases, including accessory UUID, battery-name/manufacturer, and Wi-Fi evidence; combines results in a stable list. |
+
+Flock matches are labeled **High**, **Medium**, or **Hint**. Medium/High matches can trigger enabled alerts; general vendor/name hints remain visible without alerts. Receiver-only Wi-Fi matches do not show a target RSSI, because that packet was sent by another device. These labels describe signature evidence, not independently verified camera identity. Silent, out-of-range, cellular-only, or 5 GHz-only operation can remain undetected. See [signature sources and interpretation](docs/FLOCK_DETECTION.md).
 
 ## BLE tools
 
@@ -168,12 +170,15 @@ Both firmware profiles compile. Host checks cover signal models, radio/session l
 
 The `.13` chart-range update builds and boots on the device; close-range visual confirmation remains pending. Additional cards and device types, saved-target loss/reacquisition, saved-entry Pocket Mode, and the SD firmware-update flow still need broader hardware validation. A detector appearing in the menu does not mean its accuracy has been validated against every matching device.
 
+The `.14` update passed both firmware builds, host/LVGL regressions, full BLE/Flock/Hybrid list churn on CC1101, all 20 scanner lifecycle checks, and separate 90-second BLE and Hybrid runs. The investigation and verification record is in [Performance and Flock update](docs/PERFORMANCE_14.md). Multi-day behavior and detection coverage against physical Flock cameras require field validation.
+
 See [FEATURE_PLAN.md](FEATURE_PLAN.md#validation-status) for the detailed feature scope and current validation record.
 
 ## Version tracker
 
 | Version | Status | Changes |
 |---|---|---|
+| v1.1.0-cc1101.14 | CC1101 test build | Adds display-memory headroom and reduces crowded-list redraw and SD lookup work; adds bounded Flock observation queues, current Wi-Fi/BLE signatures, confidence labels, and receiver-aware signal reporting; adds USB runtime health statistics |
 | v1.1.0-cc1101.13 | CC1101 test build | Keeps strong and weak RSSI history visible in Nearby Signals and Track Signal with full-range chart scales and bounded plotting |
 | v1.1.0-cc1101.12 | CC1101 test build | Fixes excessive stack use in saved-device storage and screen resets; 2 GB FAT32 CRUD, restart persistence, and saved Amazfit tracking verified on hardware |
 | v1.1.0-cc1101.11 | CC1101 test build | Adds SD-backed Saved Devices, guided Learn a Known Device capture, Nearby Signals, and reopening named targets in Track Signal; live discovery and Amazfit learning tested; SD validation completed in .12 |
@@ -196,6 +201,8 @@ See [FEATURE_PLAN.md](FEATURE_PLAN.md#validation-status) for the detailed featur
 - [spacehuhn / PacketMonitor32](https://github.com/spacehuhn/PacketMonitor32) — packet monitoring and graph inspiration.
 - [GhostESP Revival](https://github.com/GhostESP-Revival/GhostESP) — BLE detector ideas.
 - [Esp32vsEvil / TeslaScanner](https://github.com/Esp32vsEvil/TeslaScanner) — Tesla scanner inspiration.
+- [colonelpanichacks / flock-you](https://github.com/colonelpanichacks/flock-you) — passive frame research and firmware-derived signatures.
+- [nitekry / nite-oui-collection](https://github.com/nitekry/nite-oui-collection) — curated community prefix evidence and exclusions.
 - [0xXyc / flock-you-wifi-recon](https://github.com/0xXyc/flock-you-wifi-recon) — Flock-related matching and detection research.
 
 Use wireless analysis tools responsibly and only where authorized.

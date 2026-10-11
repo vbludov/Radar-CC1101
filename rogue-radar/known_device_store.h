@@ -9,6 +9,13 @@
 namespace rogue_radar {
 
 enum class KnownFsListResult : uint8_t { Entry, End, Error };
+enum class KnownRecordScanResult : uint8_t { Progress, Record, End, Error };
+
+struct KnownRecordScan {
+    uint32_t cursor = 0;
+    bool active = false;
+    bool incomplete = false;
+};
 
 class KnownDeviceFileSystem {
  public:
@@ -26,6 +33,7 @@ class KnownDeviceFileSystem {
     virtual bool renameFile(const char *from, const char *to) = 0;
     virtual KnownFsListResult nextFile(const char *directory, uint32_t &cursor,
                                        char *name, size_t nameSize) = 0;
+    virtual void endList() {}
     virtual bool lastErrorIsFull() const { return false; }
 };
 
@@ -59,6 +67,67 @@ class KnownDeviceStore {
     KnownStoreStatus read(uint32_t id, KnownDevice &device) {
         if (!ready()) return KnownStoreStatus::Unavailable;
         return readMounted(id, device);
+    }
+
+    // Incremental, single-pass record enumeration for live UI lookups. Each
+    // step consumes at most one directory entry and decodes at most one device.
+    // Recovery copies are accepted without renaming files while the directory
+    // iterator is live. Call endRecordScan() when abandoning a scan.
+    KnownStoreStatus beginRecordScan(KnownRecordScan &scan) {
+        endRecordScan(scan);
+        if (!ready()) return KnownStoreStatus::Unavailable;
+        scan.cursor = 0;
+        scan.active = true;
+        scan.incomplete = false;
+        return KnownStoreStatus::Ok;
+    }
+
+    KnownRecordScanResult scanRecordStep(KnownRecordScan &scan,
+                                         KnownDevice &device,
+                                         KnownStoreStatus &status) {
+        status = KnownStoreStatus::Ok;
+        if (!scan.active) {
+            status = KnownStoreStatus::InvalidArgument;
+            return KnownRecordScanResult::Error;
+        }
+        Workspace &work = workspace();
+        const KnownFsListResult listed = fs_.nextFile(
+            directory(), scan.cursor, work.name, sizeof(work.name));
+        if (listed == KnownFsListResult::End) {
+            const bool incomplete = scan.incomplete;
+            endRecordScan(scan);
+            if (incomplete) {
+                status = KnownStoreStatus::InvalidRecord;
+                return KnownRecordScanResult::Error;
+            }
+            return KnownRecordScanResult::End;
+        }
+        if (listed == KnownFsListResult::Error) {
+            status = KnownStoreStatus::IoError;
+            endRecordScan(scan);
+            return KnownRecordScanResult::Error;
+        }
+        uint32_t id = 0;
+        RecordNameKind kind = RecordNameKind::Other;
+        if (!parseScanRecordName(work.name, id, kind))
+            return KnownRecordScanResult::Progress;
+        paths(id, work);
+        // A primary file, even a corrupt one, is handled when its .kdev entry
+        // is reached. This avoids decoding every retained .lkg as a duplicate.
+        if (kind != RecordNameKind::Main && fs_.exists(work.mainPath))
+            return KnownRecordScanResult::Progress;
+        const CandidateRead candidate = readCandidateNoRepair(id, device);
+        if (candidate == CandidateRead::Invalid) scan.incomplete = true;
+        if (candidate != CandidateRead::Record)
+            return KnownRecordScanResult::Progress;
+        return KnownRecordScanResult::Record;
+    }
+
+    void endRecordScan(KnownRecordScan &scan) {
+        if (scan.active) fs_.endList();
+        scan.cursor = 0;
+        scan.active = false;
+        scan.incomplete = false;
     }
 
     // The cursor is the last returned record id, not a directory position.
@@ -178,6 +247,9 @@ class KnownDeviceStore {
     }
 
  private:
+    enum class RecordNameKind : uint8_t { Other, Main, Temporary, LastGood };
+    enum class CandidateRead : uint8_t { Skip, Record, Invalid };
+
     KnownStoreStatus readMounted(uint32_t id, KnownDevice &device) {
         if (id == 0) return KnownStoreStatus::InvalidArgument;
         Workspace &work = workspace();
@@ -294,6 +366,45 @@ class KnownDeviceStore {
         }
         id = value;
         return id != 0;
+    }
+    static bool parseScanRecordName(const char *name, uint32_t &id,
+                                    RecordNameKind &kind) {
+        kind = RecordNameKind::Other;
+        if (!name) return false;
+        const char *base = strrchr(name, '/');
+        base = base ? base + 1 : name;
+        const size_t length = strlen(base);
+        if (length != 12 && length != 13) return false;
+        const char *suffix = base + 8;
+        if (strcmp(suffix, ".kdev") == 0) kind = RecordNameKind::Main;
+        else if (strcmp(suffix, ".tmp") == 0) kind = RecordNameKind::Temporary;
+        else if (strcmp(suffix, ".lkg") == 0) kind = RecordNameKind::LastGood;
+        else return false;
+        uint32_t value = 0;
+        for (uint8_t i = 0; i < 8; ++i) {
+            const char c = base[i];
+            uint8_t digit = 0;
+            if (c >= '0' && c <= '9') digit = static_cast<uint8_t>(c - '0');
+            else if (c >= 'A' && c <= 'F') digit = static_cast<uint8_t>(c - 'A' + 10);
+            else if (c >= 'a' && c <= 'f') digit = static_cast<uint8_t>(c - 'a' + 10);
+            else return false;
+            value = (value << 4) | digit;
+        }
+        id = value;
+        return id != 0;
+    }
+
+    CandidateRead readCandidateNoRepair(uint32_t id, KnownDevice &device) {
+        Workspace &work = workspace();
+        paths(id, work);
+        if (validTombstone(work.delPath, id)) return CandidateRead::Skip;
+        if (decodeValid(work.mainPath, device) && device.id == id)
+            return CandidateRead::Record;
+        if (decodeValid(work.tmpPath, device) && device.id == id)
+            return CandidateRead::Record;
+        if (decodeValid(work.goodPath, device) && device.id == id)
+            return CandidateRead::Record;
+        return CandidateRead::Invalid;
     }
     KnownStoreStatus nextRecordId(uint32_t afterId, uint32_t &id) {
         uint32_t cursor = 0;

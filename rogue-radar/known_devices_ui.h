@@ -365,19 +365,8 @@ static void processKnownDevices() {
     const Action action = c->pending; const int argument = c->argument;
     c->pending = Action::None; run(*c, action, argument);
 }
-static void knownUiSaveCandidate(const rogue_radar::KnownAddress &address, rogue_radar::KnownRadio radio) {
-    char savedName[33]{};
-    const bool alreadySaved = knownUiIsSaved(radio, address, savedName, sizeof(savedName));
-    auto *c = known_devices_ui::begin(); if (!c) return;
-    if (alreadySaved) {
-        known_devices_ui::clear(*c, "Already saved");
-        known_devices_ui::note(*c, savedName);
-        known_devices_ui::note(*c, "Open Saved Devices to find, track, or rename this device.");
-        return;
-    }
-    c->candidate = address; c->candidateRadio = radio;
-    if (known_devices_ui::ready(*c)) known_devices_ui::candidateReview(*c, false);
-}
+static void knownUiSaveCandidate(const rogue_radar::KnownAddress &address,
+                                 rogue_radar::KnownRadio radio);
 static void knownUiAssociateCandidate(const rogue_radar::KnownAddress &address, rogue_radar::KnownRadio radio) {
     using namespace known_devices_ui;
     auto *c = begin(); if (!c) return;
@@ -395,63 +384,310 @@ static void knownUiTrackCandidate(const rogue_radar::KnownAddress &address, rogu
                         address.advertisedName[0] ? address.advertisedName : address.address,
                         address.address, address.channel, address.addressType);
 }
-static bool knownUiIsSaved(rogue_radar::KnownRadio radio, const rogue_radar::KnownAddress &address,
-                           char *name, size_t size) {
-    using namespace rogue_radar;
-    // Bounded cache keeps repeated row painting away from the SD bus. Records
-    // are streamed on a miss rather than retaining the entire library in RAM.
-    struct CacheEntry { KnownRadio radio; char mac[18]; uint8_t type; char name[33]; uint32_t checked, generation; bool valid; };
-    static CacheEntry *cache = nullptr;
-    static KnownDevice *scratch = nullptr;
-    static uint8_t replace = 0;
-    static bool unavailable = false;
-    static uint32_t unavailableAt = 0, unavailableGeneration = 0;
-    if (name && size) name[0] = '\0';
-    if (!cache) { cache = static_cast<CacheEntry *>(ps_calloc(32, sizeof(CacheEntry))); }
-    if (!scratch) { void *p = ps_malloc(sizeof(KnownDevice)); if (p) scratch = new (p) KnownDevice(); }
-    if (!cache || !scratch) return false;
-    const uint32_t now = millis();
-    // A missing card must not trigger several blocking mount attempts for
-    // every live-list repaint. Explicit Retry invalidates this negative cache.
-    if (unavailable && unavailableGeneration == known_devices_ui::libraryGeneration &&
-        now - unavailableAt < 30000) return false;
-    for (unsigned i = 0; i < 32; ++i) {
-        auto &entry = cache[i];
-        if (entry.valid && entry.generation == known_devices_ui::libraryGeneration &&
-            entry.radio == radio &&
-            (radio == KnownRadio::Wifi || entry.type == address.addressType) &&
-            strcasecmp(entry.mac, address.address) == 0 && now - entry.checked < 10000) {
-            if (name && size) snprintf(name, size, "%s", entry.name);
-            return entry.name[0] != '\0';
+
+namespace known_saved_lookup {
+using namespace rogue_radar;
+
+static constexpr uint8_t kCacheCapacity = 32;
+static constexpr uint8_t kRequestCapacity = 32;
+static constexpr uint32_t kRetryDelayMs = 30000UL;
+enum class RequestState : uint8_t { Free, Queued, Scanning };
+
+struct Identity {
+    KnownRadio radio = KnownRadio::Ble;
+    char address[18]{};
+    uint8_t addressType = 255;
+};
+struct CacheEntry {
+    Identity identity{};
+    char name[33]{};
+    bool valid = false;
+};
+struct Request {
+    Identity identity{};
+    RequestState state = RequestState::Free;
+};
+struct State {
+    CacheEntry cache[kCacheCapacity]{};
+    Request requests[kRequestCapacity]{};
+    KnownRecordScan scan{};
+    KnownDevice record{};
+    uint32_t generation = 0;
+    uint32_t retryAtMs = 0;
+    uint8_t replace = 0;
+    bool initialized = false;
+    bool retryScheduled = false;
+    bool scanStale = false;
+};
+
+static State *state = nullptr;
+
+static Identity identityFor(KnownRadio radio, const KnownAddress &address) {
+    Identity identity;
+    identity.radio = radio;
+    identity.addressType = radio == KnownRadio::Ble ? address.addressType : 255;
+    snprintf(identity.address, sizeof(identity.address), "%s", address.address);
+    return identity;
+}
+
+static bool sameIdentity(const Identity &left, const Identity &right) {
+    return left.radio == right.radio && left.addressType == right.addressType &&
+           strcasecmp(left.address, right.address) == 0;
+}
+
+static State *ensureState() {
+    if (state) return state;
+    void *memory = ps_malloc(sizeof(State));
+    if (!memory) return nullptr;
+    state = new (memory) State();
+    return state;
+}
+
+static void resetForGeneration(State &lookup) {
+    // Cache checks run in paint paths and must never touch SD. Leave an active
+    // directory handle for processOneStep()/findNow() to close later.
+    lookup.scanStale = lookup.scan.active;
+    for (uint8_t i = 0; i < kCacheCapacity; ++i)
+        lookup.cache[i].valid = false;
+    for (uint8_t i = 0; i < kRequestCapacity; ++i)
+        lookup.requests[i].state = RequestState::Free;
+    resetKnownDevice(lookup.record);
+    lookup.generation = known_devices_ui::libraryGeneration;
+    lookup.retryAtMs = 0;
+    lookup.replace = 0;
+    lookup.initialized = true;
+    lookup.retryScheduled = false;
+}
+
+static void synchronize(State &lookup) {
+    if (!lookup.initialized ||
+        lookup.generation != known_devices_ui::libraryGeneration)
+        resetForGeneration(lookup);
+}
+
+static bool cached(State &lookup, const Identity &identity, bool &saved,
+                   char *name, size_t size) {
+    for (uint8_t i = 0; i < kCacheCapacity; ++i) {
+        const CacheEntry &entry = lookup.cache[i];
+        if (!entry.valid || !sameIdentity(entry.identity, identity)) continue;
+        saved = entry.name[0] != '\0';
+        if (name && size && saved) snprintf(name, size, "%s", entry.name);
+        return true;
+    }
+    return false;
+}
+
+static void removeRequests(State &lookup, const Identity &identity) {
+    for (uint8_t i = 0; i < kRequestCapacity; ++i)
+        if (lookup.requests[i].state != RequestState::Free &&
+            sameIdentity(lookup.requests[i].identity, identity))
+            lookup.requests[i].state = RequestState::Free;
+}
+
+static void storeResult(State &lookup, const Identity &identity,
+                        const char *name) {
+    CacheEntry *destination = nullptr;
+    for (uint8_t i = 0; i < kCacheCapacity; ++i) {
+        if (lookup.cache[i].valid &&
+            sameIdentity(lookup.cache[i].identity, identity)) {
+            destination = &lookup.cache[i];
+            break;
         }
     }
-    auto &entry = cache[replace++ % 32];
-    entry = CacheEntry{}; entry.valid = true; entry.radio = radio; entry.type = address.addressType;
-    entry.generation = known_devices_ui::libraryGeneration;
-    entry.checked = now; snprintf(entry.mac, sizeof(entry.mac), "%s", address.address);
-    if (!knownDeviceStorageReady()) {
-        unavailable = true; unavailableAt = now;
-        unavailableGeneration = known_devices_ui::libraryGeneration;
+    if (!destination) destination = &lookup.cache[lookup.replace++ % kCacheCapacity];
+    destination->identity = identity;
+    destination->valid = true;
+    snprintf(destination->name, sizeof(destination->name), "%s", name ? name : "");
+    removeRequests(lookup, identity);
+}
+
+static bool enqueue(State &lookup, const Identity &identity) {
+    Request *freeRequest = nullptr;
+    for (uint8_t i = 0; i < kRequestCapacity; ++i) {
+        Request &request = lookup.requests[i];
+        if (request.state != RequestState::Free &&
+            sameIdentity(request.identity, identity)) return true;
+        if (!freeRequest && request.state == RequestState::Free)
+            freeRequest = &request;
+    }
+    if (!freeRequest) return false;  // A future paint retries after a batch drains.
+    freeRequest->identity = identity;
+    freeRequest->state = RequestState::Queued;
+    return true;
+}
+
+static bool recordMatches(const KnownDevice &device, const Identity &identity) {
+    if (device.radio != identity.radio) return false;
+    for (uint8_t i = 0; i < device.addressCount; ++i) {
+        const KnownAddress &stored = device.addresses[i];
+        if (strcasecmp(stored.address, identity.address) == 0 &&
+            (identity.radio == KnownRadio::Wifi ||
+             stored.addressType == identity.addressType)) return true;
+    }
+    return false;
+}
+
+static bool hasScanning(const State &lookup) {
+    for (uint8_t i = 0; i < kRequestCapacity; ++i)
+        if (lookup.requests[i].state == RequestState::Scanning) return true;
+    return false;
+}
+
+static bool beginBatch(State &lookup) {
+    bool any = false;
+    for (uint8_t i = 0; i < kRequestCapacity; ++i) {
+        if (lookup.requests[i].state != RequestState::Queued) continue;
+        lookup.requests[i].state = RequestState::Scanning;
+        any = true;
+    }
+    if (!any) return false;
+    const KnownStoreStatus status = knownDeviceStore().beginRecordScan(lookup.scan);
+    if (status == KnownStoreStatus::Ok) {
+        lookup.retryScheduled = false;
+        return true;
+    }
+    for (uint8_t i = 0; i < kRequestCapacity; ++i)
+        if (lookup.requests[i].state == RequestState::Scanning)
+            lookup.requests[i].state = RequestState::Queued;
+    lookup.retryAtMs = millis() + kRetryDelayMs;
+    lookup.retryScheduled = true;
+    return false;
+}
+
+static void requeueScanning(State &lookup) {
+    for (uint8_t i = 0; i < kRequestCapacity; ++i)
+        if (lookup.requests[i].state == RequestState::Scanning)
+            lookup.requests[i].state = RequestState::Queued;
+}
+
+static bool finishNegativeBatch(State &lookup) {
+    bool changed = false;
+    for (uint8_t i = 0; i < kRequestCapacity; ++i) {
+        Request &request = lookup.requests[i];
+        if (request.state != RequestState::Scanning) continue;
+        const Identity identity = request.identity;
+        storeResult(lookup, identity, nullptr);
+        changed = true;
+    }
+    return changed;
+}
+
+static bool processOneStep() {
+    State *lookup = ensureState();
+    if (!lookup) return false;
+    synchronize(*lookup);
+    if (lookup->scanStale) {
+        knownDeviceStore().endRecordScan(lookup->scan);
+        lookup->scanStale = false;
+    }
+    if (!lookup->scan.active) {
+        if (lookup->retryScheduled &&
+            static_cast<int32_t>(millis() - lookup->retryAtMs) < 0) return false;
+        if (!beginBatch(*lookup)) return false;
+    }
+
+    KnownStoreStatus status = KnownStoreStatus::Ok;
+    const KnownRecordScanResult result = knownDeviceStore().scanRecordStep(
+        lookup->scan, lookup->record, status);
+    if (result == KnownRecordScanResult::Error) {
+        requeueScanning(*lookup);
+        lookup->retryAtMs = millis() + kRetryDelayMs;
+        lookup->retryScheduled = true;
         return false;
     }
-    unavailable = false;
-    uint32_t cursor = 0, next = 0;
-    KnownDeviceSummary page[6]; uint8_t count = 0;
-    do {
-        if (knownDeviceStore().listPage(cursor, page, count, next) != KnownStoreStatus::Ok) break;
-        for (uint8_t i = 0; i < count; ++i) {
-            if (page[i].radio != radio || knownDeviceStore().read(page[i].id, *scratch) != KnownStoreStatus::Ok) continue;
-            for (uint8_t j = 0; j < scratch->addressCount; ++j)
-                if (known_devices_ui::matches(radio, scratch->addresses[j], address)) {
-                    snprintf(entry.name, sizeof(entry.name), "%s", scratch->name);
-                    if (name && size) snprintf(name, size, "%s", entry.name);
-                    return true;
-                }
+    if (result == KnownRecordScanResult::End)
+        return finishNegativeBatch(*lookup);
+    if (result != KnownRecordScanResult::Record) return false;
+
+    bool changed = false;
+    for (uint8_t i = 0; i < kRequestCapacity; ++i) {
+        Request &request = lookup->requests[i];
+        if (request.state != RequestState::Scanning ||
+            !recordMatches(lookup->record, request.identity)) continue;
+        const Identity identity = request.identity;
+        storeResult(*lookup, identity, lookup->record.name);
+        changed = true;
+    }
+    if (!hasScanning(*lookup)) knownDeviceStore().endRecordScan(lookup->scan);
+    return changed;
+}
+
+static KnownStoreStatus findNow(const Identity &identity, bool &saved,
+                                char *name, size_t size) {
+    saved = false;
+    if (name && size) name[0] = '\0';
+    State *lookup = ensureState();
+    if (!lookup) return KnownStoreStatus::Unavailable;
+    synchronize(*lookup);
+    if (cached(*lookup, identity, saved, name, size)) return KnownStoreStatus::Ok;
+
+    if (lookup->scan.active) {
+        knownDeviceStore().endRecordScan(lookup->scan);
+        lookup->scanStale = false;
+        requeueScanning(*lookup);
+    }
+    KnownRecordScan scan;
+    KnownStoreStatus status = knownDeviceStore().beginRecordScan(scan);
+    if (status != KnownStoreStatus::Ok) return status;
+    for (;;) {
+        const KnownRecordScanResult result = knownDeviceStore().scanRecordStep(
+            scan, lookup->record, status);
+        if (result == KnownRecordScanResult::Error) return status;
+        if (result == KnownRecordScanResult::End) {
+            storeResult(*lookup, identity, nullptr);
+            return KnownStoreStatus::Ok;
         }
-        if (next == cursor) break;
-        cursor = next;
-    } while (count == 6);
+        if (result != KnownRecordScanResult::Record ||
+            !recordMatches(lookup->record, identity)) continue;
+        storeResult(*lookup, identity, lookup->record.name);
+        saved = true;
+        if (name && size) snprintf(name, size, "%s", lookup->record.name);
+        knownDeviceStore().endRecordScan(scan);
+        return KnownStoreStatus::Ok;
+    }
+}
+
+}  // namespace known_saved_lookup
+
+static bool knownUiIsSaved(rogue_radar::KnownRadio radio, const rogue_radar::KnownAddress &address,
+                           char *name, size_t size) {
+    if (name && size) name[0] = '\0';
+    known_saved_lookup::State *lookup = known_saved_lookup::ensureState();
+    if (!lookup) return false;
+    known_saved_lookup::synchronize(*lookup);
+    const known_saved_lookup::Identity identity =
+        known_saved_lookup::identityFor(radio, address);
+    bool saved = false;
+    if (known_saved_lookup::cached(*lookup, identity, saved, name, size))
+        return saved;
+    known_saved_lookup::enqueue(*lookup, identity);
     return false;
+}
+
+static bool processKnownUiSavedLookups() {
+    return known_saved_lookup::processOneStep();
+}
+
+static void knownUiSaveCandidate(const rogue_radar::KnownAddress &address,
+                                 rogue_radar::KnownRadio radio) {
+    char savedName[33]{};
+    bool alreadySaved = false;
+    const auto lookupStatus = known_saved_lookup::findNow(
+        known_saved_lookup::identityFor(radio, address), alreadySaved,
+        savedName, sizeof(savedName));
+    auto *c = known_devices_ui::begin(); if (!c) return;
+    if (lookupStatus != rogue_radar::KnownStoreStatus::Ok) {
+        known_devices_ui::error(*c, lookupStatus);
+        return;
+    }
+    if (alreadySaved) {
+        known_devices_ui::clear(*c, "Already saved");
+        known_devices_ui::note(*c, savedName);
+        known_devices_ui::note(*c, "Open Saved Devices to find, track, or rename this device.");
+        return;
+    }
+    c->candidate = address; c->candidateRadio = radio;
+    if (known_devices_ui::ready(*c)) known_devices_ui::candidateReview(*c, false);
 }
 static void knownInstallSaveButton(lv_obj_t *screen, lv_group_t *group, lv_obj_t *back,
                                    lv_obj_t *track, rogue_radar::KnownRadio radio,

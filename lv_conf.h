@@ -13,6 +13,10 @@
 
 #define LV_COLOR_DEPTH 16
 
+// Permit the CC1101 startup code to register a 128 KB PSRAM pool.
+// LVGL 9 sizes TLSF bookkeeping from this value; it does not allocate it.
+#define LV_MEM_POOL_EXPAND_SIZE (128 * 1024U)
+
 #define LV_USE_LOG 1
 #define LV_LOG_LEVEL LV_LOG_LEVEL_WARN
 

@@ -17,6 +17,9 @@ class MemoryFs : public KnownDeviceFileSystem {
     bool fullError = false;
     int failAppendCall = -1;
     int appendCallCount = 0;
+    uint32_t listCalls = 0;
+    uint32_t readCalls = 0;
+    uint32_t endListCalls = 0;
     std::string failRenameFrom;
     std::string failRemovePath;
     std::map<std::string, std::vector<uint8_t> > files;
@@ -30,6 +33,7 @@ class MemoryFs : public KnownDeviceFileSystem {
         return true;
     }
     bool readAt(const char *path, uint32_t offset, void *data, size_t size) override {
+        ++readCalls;
         if (!online || !exists(path) || offset + size > files[path].size()) return false;
         memcpy(data, files[path].data() + offset, size);
         return true;
@@ -74,6 +78,7 @@ class MemoryFs : public KnownDeviceFileSystem {
     }
     KnownFsListResult nextFile(const char *, uint32_t &cursor, char *name,
                                size_t nameSize) override {
+        ++listCalls;
         if (!online) return KnownFsListResult::Error;
         std::vector<std::string> names;
         for (std::map<std::string, std::vector<uint8_t> >::const_iterator it = files.begin();
@@ -86,6 +91,7 @@ class MemoryFs : public KnownDeviceFileSystem {
         name[nameSize - 1] = '\0';
         return KnownFsListResult::Entry;
     }
+    void endList() override { ++endListCalls; }
     bool lastErrorIsFull() const override { return fullError; }
 
  private:
@@ -276,6 +282,57 @@ static void testEverySerializedWriteCutpointPreservesMain() {
     }
 }
 
+static void testIncrementalSinglePassRecordScan() {
+    MemoryFs fs;
+    KnownDeviceStore store(fs);
+    for (int i = 0; i < 8; ++i) {
+        char label[16], address[18];
+        snprintf(label, sizeof(label), "Scan %d", i);
+        snprintf(address, sizeof(address), "20:30:40:50:60:%02X", i);
+        KnownDevice device = sample(label, address);
+        assert(store.create(device) == KnownStoreStatus::Ok);
+    }
+    fs.files[std::string(KnownDeviceStore::directory()) + "/notes.txt"] =
+        std::vector<uint8_t>(5, 1);
+    fs.files["/unrelated/keep.bin"] = std::vector<uint8_t>(4, 2);
+
+    // A main-missing last-good copy remains discoverable without mutating it.
+    fs.files[path(3, "lkg")] = fs.files[path(3, "kdev")];
+    fs.files.erase(path(3, "kdev"));
+
+    fs.listCalls = fs.readCalls = fs.endListCalls = 0;
+    KnownRecordScan scan;
+    assert(store.beginRecordScan(scan) == KnownStoreStatus::Ok);
+    uint32_t records = 0;
+    uint32_t steps = 0;
+    bool recoveredThree = false;
+    KnownDevice loaded{};
+    for (;;) {
+        const uint32_t beforeList = fs.listCalls;
+        KnownStoreStatus status = KnownStoreStatus::Ok;
+        const KnownRecordScanResult result = store.scanRecordStep(scan, loaded, status);
+        ++steps;
+        assert(fs.listCalls == beforeList + 1);  // One directory entry/end probe per tick.
+        if (result == KnownRecordScanResult::Record) {
+            ++records;
+            if (loaded.id == 3) recoveredThree = true;
+        } else if (result == KnownRecordScanResult::End) {
+            break;
+        } else {
+            assert(result == KnownRecordScanResult::Progress);
+        }
+    }
+    const uint32_t directoryEntries = 9;  // Seven mains, one lkg, one notes file.
+    assert(steps == directoryEntries + 1);
+    assert(fs.listCalls == directoryEntries + 1);
+    assert(records == 8 && recoveredThree);
+    // Each valid record is decoded once (CRC chunks plus bounded fields), so
+    // read traffic grows linearly with records rather than pages squared.
+    assert(fs.readCalls <= records * 130);
+    assert(fs.endListCalls == 1);
+    assert(fs.files.count(path(3, "lkg")) == 1 && fs.files.count(path(3, "kdev")) == 0);
+}
+
 int main() {
     testCrudAndPagination();
     testRecoveryAndMalformedData();
@@ -283,5 +340,6 @@ int main() {
     testValidation();
     testInPlaceReset();
     testEverySerializedWriteCutpointPreservesMain();
+    testIncrementalSinglePassRecordScan();
     std::cout << "known_device_store_test passed\n";
 }

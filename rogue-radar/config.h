@@ -10,7 +10,7 @@
 // ─── Device Name / Firmware Version ─────────────────────────────
 #define DEVICE_NAME       "Rogue Radar"
 #if defined(ROGUE_RADAR_BOARD_T_EMBED_CC1101)
-#define FIRMWARE_VERSION  "RR v1.1.0-cc1101.13"
+#define FIRMWARE_VERSION  "RR v1.1.0-cc1101.14"
 #else
 #define FIRMWARE_VERSION  "RR v1.0.5"
 #endif
@@ -370,22 +370,8 @@ static const char* CONNECT_AP_CONFIG_PASSWORDS[CONNECT_AP_CONFIG_CRED_COUNT] = {
 // ─── Flock Safety Detector ──────────────────────────────────────
 #define MAX_FLOCK_HITS  20
 
-// Extra WiFi SSID keywords used by the Flock detector.
-// These are checked case-insensitively against beacon/probe SSIDs.
-#define FLOCK_KEYWORD_1  "flock"
-#define FLOCK_KEYWORD_2  "penguin"
-#define FLOCK_KEYWORD_3  "pigvision"
-#define FLOCK_KEYWORD_4  "fs ext battery"
-#define FLOCK_KEYWORD_5  "FS_"
-#define FLOCK_KEYWORD_6  "FlockOS"
-#define FLOCK_KEYWORD_7  "flocksafety"
-#define FLOCK_KEYWORD_8  "FlockCam"
-#define FLOCK_KEYWORD_9  "FS-"
-
-// Stronger SSID/name pattern check for IDs like Flock-1A2B.
-// This is more specific than the generic "flock" keyword.
-#define FLOCK_STRICT_ID_PATTERN_ENABLED  1
-#define FLOCK_STRICT_ID_MIN_HEX_CHARS    4
+// Passive signature definitions and evidence levels: flock_detection.h and
+// flock_ble_detection.h. Prefix-only matches are hints, not verified identity.
 
 // Adaptive WiFi dwell for Flock sniffing.
 // Channels 1, 6, and 11 get a longer dwell because many 2.4GHz networks
@@ -394,18 +380,7 @@ static const char* CONNECT_AP_CONFIG_PASSWORDS[CONNECT_AP_CONFIG_CRED_COUNT] = {
 #define FLOCK_DWELL_MAIN_MS            500
 #define FLOCK_DWELL_OTHER_MS           180
 
-// 1 = dedupe Flock hits mainly by source MAC, 0 = dedupe by SSID only.
-#define FLOCK_DEDUPE_BY_MAC  1
-
-// 1 = show source MAC under each Flock hit row, 0 = compact one-line rows.
-#define FLOCK_SHOW_SOURCE_MAC  1
-
-// ─── Flock Upgrade Pass 1 ─────────────────────────────────────
-// Adds expanded MAC/OUI matching, BLE manufacturer ID matching,
-// confidence labels, method labels, and richer hit details.
-#define FLOCK_MAC_PREFIX_MATCH_ENABLED      1
-#define FLOCK_BLE_MFR_ID_MATCH_ENABLED      1
-#define FLOCK_BLE_MFR_ID_XUNTONG       0x09C8
+// Results are deduplicated by observed address (and BLE address type).
 #define FLOCK_HYBRID_SHOW_HEARD_COUNT       1
 
 // ─── Flock Hybrid Scanner ──────────────────────────────────────

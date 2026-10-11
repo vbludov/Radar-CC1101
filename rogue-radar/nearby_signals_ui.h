@@ -29,6 +29,7 @@ struct State {
     lv_obj_t *rowLabels[kRowsPerPage]{};
     lv_obj_t *rowCharts[kRowsPerPage]{};
     lv_chart_series_t *rowChartSeries[kRowsPerPage]{};
+    uint32_t rowPaintSignature[kRowsPerPage]{};
     KnownSignalTable *table = nullptr;
     KnownLearningSession *learning = nullptr;
     KnownRadio radio = KnownRadio::Ble;
@@ -83,6 +84,22 @@ static const char *trendLabel(KnownSignalTrend trend) {
         case KnownSignalTrend::Steady: return "=";
         default: return "?";
     }
+}
+
+static uint32_t renderSignature(const char *text, const KnownSignalCandidate &candidate) {
+    uint32_t hash = 2166136261UL;
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(text); *p; ++p) {
+        hash ^= *p;
+        hash *= 16777619UL;
+    }
+    for (size_t i = 0; i < KnownSignalTable::HistoryBuckets; ++i) {
+        const uint16_t value = static_cast<uint16_t>(candidate.history[i]);
+        hash ^= value & 0xff;
+        hash *= 16777619UL;
+        hash ^= value >> 8;
+        hash *= 16777619UL;
+    }
+    return hash ? hash : 1;
 }
 
 static bool isExcluded(const KnownSignalIdentity &identity) {
@@ -149,6 +166,7 @@ static void prepareScreen(const char *title) {
     memset(state.rowLabels, 0, sizeof(state.rowLabels));
     memset(state.rowCharts, 0, sizeof(state.rowCharts));
     memset(state.rowChartSeries, 0, sizeof(state.rowChartSeries));
+    memset(state.rowPaintSignature, 0, sizeof(state.rowPaintSignature));
 }
 
 static void addToGroup(lv_obj_t *object) {
@@ -631,6 +649,7 @@ static void paintList() {
         const KnownSignalCandidate *candidate = state.table->candidateAtRank(rank);
         if (!candidate) {
             lv_obj_add_flag(state.rows[slot], LV_OBJ_FLAG_HIDDEN);
+            state.rowPaintSignature[slot] = 0;
             continue;
         }
         lv_obj_remove_flag(state.rows[slot], LV_OBJ_FLAG_HIDDEN);
@@ -644,6 +663,9 @@ static void paintList() {
                  saved ? "*" : "", name, candidate->smoothedRssi,
                  trendLabel(candidate->trend), candidate->identity.address,
                  candidate->stale ? " stale" : "");
+        const uint32_t signature = renderSignature(text, *candidate);
+        if (state.rowPaintSignature[slot] == signature) continue;
+        state.rowPaintSignature[slot] = signature;
         lv_label_set_text(state.rowLabels[slot], text);
         lv_chart_set_series_color(state.rowCharts[slot], state.rowChartSeries[slot],
                                   bleRssiColor(candidate->smoothedRssi));
@@ -670,7 +692,9 @@ static void paintList() {
              knownDiscoveryStatus(), static_cast<unsigned>(state.table->count()),
              state.page + 1, pages ? pages : 1,
              knownDiscoveryBackend.dropped() ? "  drops" : "");
-    lv_label_set_text(state.status, status);
+    const char *currentStatus = lv_label_get_text(state.status);
+    if (!currentStatus || strcmp(currentStatus, status) != 0)
+        lv_label_set_text(state.status, status);
 }
 
 static bool startScanner(KnownRadio radio, bool resetTable) {
@@ -846,7 +870,7 @@ static void process() {
     // dominate the walking survey. Frozen selection remains explicitly stale.
     state.table->expireStale(now, 10000);
     state.table->refreshRanking(now, 1000);
-    if (state.view == View::List && now - state.lastPaintMs >= 500) {
+    if (state.view == View::List && now - state.lastPaintMs >= 1000) {
         state.lastPaintMs = now;
         paintList();
     } else if (state.view == View::Learn && now - state.lastPaintMs >= 1000) {
@@ -872,6 +896,9 @@ static void createNearbySignalsForAssociation(rogue_radar::KnownRadio radio) {
 
 static void processNearbySignals() {
     rogue_radar::nearby_ui::process();
+    if (processKnownUiSavedLookups() && rogue_radar::nearby_ui::state.active &&
+        rogue_radar::nearby_ui::state.view == rogue_radar::nearby_ui::View::List)
+        rogue_radar::nearby_ui::state.lastPaintMs = 0;
 }
 
 static bool nearbySignalsActive() {

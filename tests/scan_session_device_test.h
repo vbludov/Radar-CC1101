@@ -192,7 +192,11 @@ static void advancePage() {
 }
 
 static void begin() {
+#if defined(ROGUE_RADAR_HYBRID_STACK_TEST) && ROGUE_RADAR_HYBRID_STACK_TEST
+    Serial.println("[ScanDiag] BEGIN focused Hybrid radio/stack soak");
+#else
     Serial.println("[ScanDiag] BEGIN 20-page lifecycle + BLE/Hybrid soak");
+#endif
     pageIndex = pagePass = 0;
     minHeap = minPsram = minLvglFree = UINT32_MAX;
     pocketChecked = autoHomeChecked = false;
@@ -206,7 +210,11 @@ static void process() {
         case Stage::WaitBoot:
             if (!reached(actionAtMs)) return;
             createWiFiMenu();
+#if defined(ROGUE_RADAR_HYBRID_STACK_TEST) && ROGUE_RADAR_HYBRID_STACK_TEST
+            setStage(Stage::HybridSoakWaitPage, 350);
+#else
             setStage(Stage::WaitMenu, 350);
+#endif
             return;
 
         case Stage::WaitMenu:
@@ -439,6 +447,9 @@ static void process() {
             }
             if (millis() - lastMemoryLogMs >= 5000) {
                 lastMemoryLogMs = millis(); logMemory("Hybrid soak");
+                Serial.printf("[ScanDiag] Hybrid BTC stack minimum=%lu bytes, heard=%lu\n",
+                              (unsigned long)hybridCallbackStackMinimum,
+                              (unsigned long)hybridBleHeardCount);
             }
             if (!reached(actionAtMs)) return;
             Serial.printf("[ScanDiag] Hybrid active Back phase=%s\n", scanSession.phase);
@@ -451,7 +462,12 @@ static void process() {
             if (scanSessionAttached() || lv_display_get_screen_prev(lvDisp) ||
                 lv_screen_active() != wifiMenuScreen) return;
             logMemory("final");
-            Serial.printf("[ScanDiag] PASS all pages; minima heap=%lu psram=%lu lvgl=%lu\n",
+            Serial.printf("[ScanDiag] PASS%s; minima heap=%lu psram=%lu lvgl=%lu\n",
+#if defined(ROGUE_RADAR_HYBRID_STACK_TEST) && ROGUE_RADAR_HYBRID_STACK_TEST
+                          " focused Hybrid soak",
+#else
+                          " all pages",
+#endif
                           (unsigned long)minHeap, (unsigned long)minPsram,
                           (unsigned long)minLvglFree);
             stage = Stage::Done;

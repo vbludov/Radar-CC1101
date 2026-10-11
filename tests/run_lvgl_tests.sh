@@ -70,3 +70,37 @@ echo "PASS original cancel recreation reproduced allocator failure (exit $old_st
     "$repo_root/tests/known_devices_ui_test.cpp" \
     "$tmp_dir/liblvgl.a" -lm -o "$tmp_dir/known_devices_ui_test"
 "$tmp_dir/known_devices_ui_test"
+
+"${CXX:-g++}" -std=c++11 -O0 -Wall -Wextra -Werror \
+    -I"$tmp_dir" -I"$lvgl_dir" -DLV_CONF_INCLUDE_SIMPLE \
+    "$repo_root/tests/lvgl_hybrid_pool_test.cpp" \
+    "$tmp_dir/liblvgl.a" -lm -o "$tmp_dir/lvgl_hybrid_pool_test"
+"$tmp_dir/lvgl_hybrid_pool_test" baseline
+"$tmp_dir/lvgl_hybrid_pool_test" expanded
+
+# Compile the production helper itself with a minimal LVGL fixture. This keeps
+# the regression tied to the implementation while avoiding an Arduino sketch
+# dependency in the host test.
+awk '
+    /^static int pwnFocusedIndex\(\)/ { copying = 1 }
+    copying {
+        print
+        line = $0
+        opens = gsub(/\{/, "{", line)
+        line = $0
+        closes = gsub(/\}/, "}", line)
+        depth += opens - closes
+        if(opens) saw_open = 1
+        if(saw_open && depth == 0) exit
+    }
+' "$repo_root/rogue-radar/rogue-radar.ino" >"$tmp_dir/pwn_focused_index.inc"
+if ! grep -q 'pwnRowBtns\[i\] == focused' "$tmp_dir/pwn_focused_index.inc"; then
+    echo "FAIL: production pwnFocusedIndex helper extraction did not match retained rows" >&2
+    exit 1
+fi
+"${CXX:-g++}" -std=c++11 -O0 -Wall -Wextra -Werror \
+    -I"$tmp_dir" -I"$lvgl_dir" -DLV_CONF_INCLUDE_SIMPLE \
+    -DPWN_FOCUSED_HELPER_INCLUDE='"pwn_focused_index.inc"' \
+    "$repo_root/tests/lvgl_pwn_focus_test.cpp" \
+    "$tmp_dir/liblvgl.a" -lm -o "$tmp_dir/lvgl_pwn_focus_test"
+"$tmp_dir/lvgl_pwn_focus_test"

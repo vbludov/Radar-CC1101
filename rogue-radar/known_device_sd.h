@@ -32,8 +32,8 @@ class KnownDeviceSdFileSystem : public KnownDeviceFileSystem {
     }
 
     bool mount(bool force) {
-        closeCachedHandles();
         if (!force && mounted_ && SD.cardType() != CARD_NONE) return true;
+        closeCachedHandles();
         mounted_ = false;
         const uint32_t now = millis();
         if (!force && mountAttempted_ && now - lastMountAttemptMs_ < kMountRetryMs)
@@ -165,12 +165,14 @@ class KnownDeviceSdFileSystem : public KnownDeviceFileSystem {
         if (!entry) { closeList(); return KnownFsListResult::End; }
         ++listCursor_;
         cursor = listCursor_;
-        const bool regular = !entry.isDirectory();
         copyPath(name, nameSize, entry.name());
         entry.close();
-        if (!regular) return nextFile(directory, cursor, name, nameSize);
+        // Callers validate record names. Returning directories as ordinary
+        // non-matching entries keeps incremental scans to one entry per step.
         return KnownFsListResult::Entry;
     }
+
+    void endList() override { closeList(); }
 
  private:
     static void copyPath(char *dst, size_t capacity, const char *src) {

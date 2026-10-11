@@ -55,6 +55,10 @@
 #include <Arduino.h>
 #include "config.h"
 #include "known_devices_api.h"
+#include "flock_observation_queue.h"
+#include "flock_detection.h"
+#include "flock_ble_detection.h"
+using FlockQueue = rogue_radar::FlockObservationQueue<16>;
 
 
 #ifndef AUDIO_RECORD_STOP_POLL_MS
@@ -536,6 +540,11 @@ static lv_obj_t   *wifiMapperPauseBtn = nullptr;
 static lv_obj_t   *wifiMapperPauseLbl = nullptr;
 static lv_obj_t   *wifiMapperSpeedBtn = nullptr;
 static lv_obj_t   *wifiMapperSpeedLbl = nullptr;
+static bool        wifiMapperGridBuilt = false;
+static lv_obj_t   *wifiMapperHighlight = nullptr;
+static lv_obj_t   *wifiMapperChannelLines[13] = {nullptr};
+static lv_obj_t   *wifiMapperDots[WIFI_MAPPER_MAX_POINTS] = {nullptr};
+static uint16_t    wifiMapperDotCount = 0;
 
 // ─── Screen Pointers ────────────────────────────────────────────
 static lv_obj_t *mainScreen       = nullptr;
@@ -712,6 +721,7 @@ struct DeauthEvent {
 static DeauthEvent   deauthLog[MAX_DEAUTH];
 static volatile int  deauthHead    = 0;
 static volatile int  deauthTotal   = 0;
+static volatile uint32_t deauthGeneration = 0;
 static int           deauthSoundedTotal = 0;
 static volatile bool deauthActive  = false;
 static uint8_t       deauthChannel = 1;
@@ -782,6 +792,12 @@ static char            pwnPendingBSSID[18];
 static volatile int8_t pwnPendingRSSI  = 0;
 static volatile uint8_t pwnPendingChannel = 1;
 static volatile bool   pwnPendingReady = false;
+static lv_obj_t       *pwnRowBtns[MAX_PWNS] = {nullptr};
+static lv_obj_t       *pwnRowLabels[MAX_PWNS] = {nullptr};
+static int             pwnRowCount = 0;
+static lv_obj_t       *pwnEmptyLbl = nullptr;
+static bool            pwnListDirty = true;
+static uint32_t        pwnLastPaintSecond = UINT32_MAX;
 
 // ── Flock Safety Detector ────────────────────────────────────────
 //
@@ -795,11 +811,12 @@ struct FlockHit {
     char     ssid[33];
     char     src[18];       // source MAC of the frame
     char     method[18];    // Name / MAC Prefix / MFR Prefix / SoundThinking
-    char     confidence[8]; // High / Medium / Low
-    char     type[20];      // Flock / Flock MFR / SoundThinking
+    char     confidence[8]; // High / Medium / Hint
+    char     type[24];      // Signature classification, not verified identity
     uint8_t  frameType;     // 0=beacon/resp, 1=probe req
     int8_t   rssi;
-    uint16_t count;
+    uint32_t count;
+    bool receiverOnly;
     uint32_t firstSeen;
     uint32_t lastSeen;
 };
@@ -809,15 +826,31 @@ static int            flockHitCount   = 0;
 static volatile bool  flockActive     = false;
 static lv_timer_t    *flockTimer      = nullptr;
 
-// ISR pending slot — one frame at a time into main task
-static char            flockPendingSSID[33];
-static char            flockPendingSrc[18];
-static char            flockPendingMethod[18];
-static char            flockPendingConfidence[8];
-static char            flockPendingDeviceType[20];
-static volatile uint8_t flockPendingType = 0;
-static volatile int8_t  flockPendingRSSI = 0;
-static volatile bool    flockPendingReady = false;
+static FlockQueue flockQueue, hybridWifiQueue, hybridBleQueue;
+static portMUX_TYPE flockQueueMux = portMUX_INITIALIZER_UNLOCKED;
+static lv_obj_t *flockRows[MAX_FLOCK_HITS]{};
+static uint8_t flockRowCount = 0;
+static uint32_t flockLastPaint = 0;
+
+static void resetFlockQueue(FlockQueue &queue) {
+    portENTER_CRITICAL(&flockQueueMux);
+    queue.reset();
+    portEXIT_CRITICAL(&flockQueueMux);
+}
+static void pushFlockQueue(FlockQueue &queue, const rogue_radar::FlockObservation &hit) {
+    portENTER_CRITICAL(&flockQueueMux);
+    queue.push(hit);
+    portEXIT_CRITICAL(&flockQueueMux);
+}
+static bool popFlockQueue(FlockQueue &queue, rogue_radar::FlockObservation &hit) {
+    portENTER_CRITICAL(&flockQueueMux);
+    const bool found = queue.pop(hit);
+    portEXIT_CRITICAL(&flockQueueMux);
+    return found;
+}
+static void flockSetLabel(lv_obj_t *label, const char *text) {
+    if (label && strcmp(lv_label_get_text(label), text)) lv_label_set_text(label, text);
+}
 
 // ── Flock Hybrid Scanner ───────────────────────────────────────
 //  Combined BLE + WiFi Flock scan. This intentionally alternates phases
@@ -828,10 +861,12 @@ struct FlockHybridHit {
     char     mac[18];
     char     reason[24];     // Short match reason shown in rows
     char     method[24];     // Name / MAC Prefix / MFR Prefix / BLE MFR ID
-    char     confidence[8];  // High / Medium / Low
-    char     type[20];       // Flock / Flock MFR / SoundThinking
+    char     confidence[8];  // High / Medium / Hint
+    char     type[24];       // Signature classification, not verified identity
+    uint8_t addressType;
     int8_t   rssi;
-    uint16_t count;
+    uint32_t count;
+    bool receiverOnly;
     uint32_t firstSeen;
     uint32_t lastSeen;
 };
@@ -852,23 +887,11 @@ static uint32_t hybridWifiPhaseStartedMs = 0;
 static uint32_t hybridWifiLastHopMs = 0;
 static uint8_t hybridWifiChannel = 1;
 
-struct HybridBleMailbox {
-    char name[33], mac[18], reason[24], method[24], confidence[8], type[20];
-    int8_t rssi;
-    bool ready;
-};
-static HybridBleMailbox hybridBleMailbox{};
 static portMUX_TYPE hybridBleMux = portMUX_INITIALIZER_UNLOCKED;
-
-// ISR pending slot for the WiFi half of the hybrid scanner
-static char             hybridPendingName[33];
-static char             hybridPendingMac[18];
-static char             hybridPendingReason[24];
-static char             hybridPendingMethod[24];
-static char             hybridPendingConfidence[8];
-static char             hybridPendingType[20];
-static volatile int8_t  hybridPendingRSSI = 0;
-static volatile bool    hybridPendingReady = false;
+static lv_obj_t *hybridRows[MAX_FLOCK_HYBRID_HITS]{};
+static uint8_t hybridRowCount = 0;
+static bool hybridRowsReset = true;
+static uint32_t hybridLastPaint = 0;
 
 // ════════════════════════════════════════════════════════════════
 //  BLE DATA STRUCTURES
@@ -1018,8 +1041,6 @@ struct LiveBleObservation {
 
 // Explicit declarations keep Arduino's generated prototypes below these types.
 static BLEDeviceType classifyBleAdvertisement(BLEAdvertisedDevice &dev);
-static bool liveBleModeMatches(LiveBleMode mode, BLEDeviceType type,
-                               BLEAdvertisedDevice &dev);
 static void liveBleMailboxPush(const LiveBleObservation &observation);
 static bool liveBleMailboxPop(LiveBleObservation &observation);
 static void resetLiveBleResults(LiveBleMode mode);
@@ -6782,6 +6803,10 @@ static lv_obj_t *deauthStatsLbl  = nullptr;
 static lv_obj_t *deauthStatsBar  = nullptr;
 static lv_obj_t *deauthBackBtn   = nullptr;
 static lv_obj_t *deauthStartBtn  = nullptr;
+static lv_obj_t *deauthRows[MAX_DEAUTH] = {nullptr};
+static int       deauthRowCount = 0;
+static lv_obj_t *deauthEmptyLbl = nullptr;
+static uint32_t  deauthPaintedGeneration = UINT32_MAX;
 
 // ════════════════════════════════════════════════════════════════
 //  SHARED BACK CALLBACKS
@@ -6927,15 +6952,32 @@ static void cb_wifiDetailBack(lv_event_t *e) {
 // ════════════════════════════════════════════════════════════════
 static lv_obj_t *scanList      = nullptr;
 static lv_obj_t *scanStatusLbl = nullptr;
-static lv_obj_t *scanBackBtn   = nullptr;   // saved so rebuildScanList can rebuild the group
+static lv_obj_t *scanBackBtn   = nullptr;
 static lv_obj_t *scanScanBtn   = nullptr;
+static lv_obj_t *scanRowBtns[MAX_WIFI_RESULTS] = {};
+static lv_obj_t *scanRowLabels[MAX_WIFI_RESULTS] = {};
+static lv_obj_t *scanEmptyLbl = nullptr;
+static int scanRowCount = 0;
 static char scanFocusedBssid[18] = {};
-static void rebuildScanList();
+static void refreshScanRows();
+
+static void captureScanFocus() {
+    scanFocusedBssid[0] = '\0';
+    if (!wifiToolGroup) return;
+    lv_obj_t *focused = lv_group_get_focused(wifiToolGroup);
+    for (int i = 0; i < wifiEntryCount && i < scanRowCount; ++i) {
+        if (scanRowBtns[i] == focused) {
+            snprintf(scanFocusedBssid, sizeof(scanFocusedBssid), "%s", wifiEntries[i].bssid);
+            return;
+        }
+    }
+}
 
 static bool networkScanStart() {
     if (!scanSessionIsResume()) {
+        captureScanFocus();
         wifiEntryCount = 0;
-        rebuildScanList();
+        refreshScanRows();
     }
     scanSessionPhase("scanning networks");
     return liveWifiScanStartCycle();
@@ -6947,16 +6989,8 @@ static bool networkScanStop() {
 
 static int networkScanCount() { return wifiEntryCount; }
 
-static void rebuildScanList() {
-    // Rebuild group first — lv_obj_clean will invalidate the old list buttons
-    // that are still referenced inside wifiToolGroup, causing a crash on back.
-    deleteGroup(&wifiToolGroup);
-    wifiToolGroup = lv_group_create();
-    if (scanBackBtn) lv_group_add_obj(wifiToolGroup, scanBackBtn);
-    if (scanScanBtn) lv_group_add_obj(wifiToolGroup, scanScanBtn);
-    setGroup(wifiToolGroup);
-
-    lv_obj_clean(scanList);
+static void refreshScanRows() {
+    if (!scanList || !wifiToolGroup) return;
     lv_obj_t *restoreFocus = nullptr;
     for (int i = 0; i < wifiEntryCount; i++) {
         char row[56];
@@ -6967,19 +7001,38 @@ static void rebuildScanList() {
         snprintf(row, sizeof(row), "%s %-16s Ch%-2d %ddBm",
                  lock, ssidTrunc, wifiEntries[i].channel, wifiEntries[i].rssi);
 
-        lv_obj_t *btn = lv_list_add_btn(scanList, nullptr, row);
-        styleListBtn(btn);
+        if (i >= scanRowCount) {
+            lv_obj_t *btn = lv_list_add_btn(scanList, nullptr, "");
+            scanRowBtns[i] = btn;
+            scanRowLabels[i] = lv_obj_get_child(btn, 0);
+            styleListBtn(btn);
+            lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+                scanRequestNavigation(createNetworkDetail,
+                                      (int)(intptr_t)lv_event_get_user_data(ev));
+            }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+            scanRowCount++;
+        }
+        lv_obj_t *btn = scanRowBtns[i];
+        lv_label_set_text(scanRowLabels[i], row);
+        lv_obj_remove_flag(btn, LV_OBJ_FLAG_HIDDEN);
+        if (lv_obj_get_group(btn) != wifiToolGroup) lv_group_add_obj(wifiToolGroup, btn);
         lv_obj_set_style_text_color(btn, rssiColor(wifiEntries[i].rssi),
                                     LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
-            scanRequestNavigation(createNetworkDetail,
-                                  (int)(intptr_t)lv_event_get_user_data(ev));
-        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        lv_group_add_obj(wifiToolGroup, btn);
         if (scanFocusedBssid[0] && strcmp(scanFocusedBssid, wifiEntries[i].bssid) == 0) restoreFocus = btn;
     }
+    for (int i = wifiEntryCount; i < scanRowCount; ++i) {
+        if (lv_obj_get_group(scanRowBtns[i])) lv_group_remove_obj(scanRowBtns[i]);
+        lv_obj_add_flag(scanRowBtns[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (!scanEmptyLbl) {
+        scanEmptyLbl = lv_list_add_text(scanList, "No networks found yet.");
+        lv_obj_set_style_text_color(scanEmptyLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    }
+    if (wifiEntryCount == 0) lv_obj_remove_flag(scanEmptyLbl, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(scanEmptyLbl, LV_OBJ_FLAG_HIDDEN);
     scanRestoreControls();
     if (restoreFocus) lv_group_focus_obj(restoreFocus);
+    else if (scanFocusedBssid[0] && scanScanBtn) lv_group_focus_obj(scanScanBtn);
     scanFocusedBssid[0] = '\0';
 }
 
@@ -6987,17 +7040,10 @@ static void networkScanPoll() {
     const int result = liveWifiScanResult();
     if (result == WIFI_SCAN_RUNNING) return;
 
-    if (scanList && wifiToolGroup) {
-        lv_obj_t *focused = lv_group_get_focused(wifiToolGroup);
-        for (int i = 0; i < wifiEntryCount; ++i) {
-            if (lv_obj_get_child(scanList, i) == focused) {
-                snprintf(scanFocusedBssid, sizeof(scanFocusedBssid), "%s", wifiEntries[i].bssid);
-                break;
-            }
-        }
-    }
+    captureScanFocus();
 
     int count = result;
+    if (count < 0) count = 0;
     if (count > wifiMaxResults) count = wifiMaxResults;
     if (count > MAX_WIFI_RESULTS) count = MAX_WIFI_RESULTS;
     wifiEntryCount = count;
@@ -7015,12 +7061,13 @@ static void networkScanPoll() {
     }
     WiFi.scanDelete();
     sortByRSSI();
-    rebuildScanList();
+    refreshScanRows();
     scanSessionPhase(count == 1 ? "network found" : "networks found");
     if (!liveWifiScanStartCycle()) scanSessionError("WiFi scan restart failed");
 }
 
 void createNetworkScanner() {
+    wifiEntryCount = 0;
     if (wifiToolScreen) { lv_obj_delete(wifiToolScreen); wifiToolScreen = nullptr; }
     wifiToolScreen = lv_obj_create(nullptr);
     applyScreenStyle(wifiToolScreen);
@@ -7040,6 +7087,11 @@ void createNetworkScanner() {
     lv_obj_set_style_border_width(scanList, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(scanList,      2, LV_PART_MAIN);
     lv_obj_set_style_pad_row(scanList,      2, LV_PART_MAIN);
+    memset(scanRowBtns, 0, sizeof(scanRowBtns));
+    memset(scanRowLabels, 0, sizeof(scanRowLabels));
+    scanRowCount = 0;
+    scanEmptyLbl = nullptr;
+    scanFocusedBssid[0] = '\0';
 
     scanBackBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
     scanScanBtn = createActionBtn(wifiToolScreen,
@@ -7054,6 +7106,7 @@ void createNetworkScanner() {
     attachScanSession(wifiToolScreen, &wifiToolGroup, scanBackBtn, scanScanBtn,
                       scanStatusLbl, "scanNet", (uint32_t)wifiScanSeconds * 1000UL,
                       {networkScanStart, networkScanPoll, networkScanStop, networkScanCount});
+    refreshScanRows();
 
     lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
@@ -9010,6 +9063,7 @@ static void IRAM_ATTR sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (pkt->rx_ctrl.rssi > deauthStrongestRSSI) deauthStrongestRSSI = pkt->rx_ctrl.rssi;
 
     deauthHead = (deauthHead + 1) % MAX_DEAUTH;
+    ++deauthGeneration;
 }
 
 
@@ -9143,26 +9197,43 @@ static void deauth_refresh_cb(lv_timer_t *) {
         lv_obj_set_style_bg_color(deauthStatsBar, rssiColor(barRssi), LV_PART_INDICATOR);
     }
 
-    lv_obj_clean(deauthEventList);
-    int total = (deauthTotal < MAX_DEAUTH) ? deauthTotal : MAX_DEAUTH;
+    int total, head;
+    uint32_t generationBefore, generation;
+    do {
+        generationBefore = deauthGeneration;
+        total = (deauthTotal < MAX_DEAUTH) ? deauthTotal : MAX_DEAUTH;
+        head = deauthHead;
+        generation = deauthGeneration;
+    } while (generationBefore != generation);
+    if (generation == deauthPaintedGeneration) return;
+    deauthPaintedGeneration = generation;
 
-    if (total == 0) {
-        lv_obj_t *e = lv_list_add_text(deauthEventList, "No frames detected yet...");
-        if (e) lv_obj_set_style_text_color(e, lv_color_hex(TH.textDim), LV_PART_MAIN);
-        return;
+    if (deauthEmptyLbl) {
+        if (total == 0) lv_obj_remove_flag(deauthEmptyLbl, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(deauthEmptyLbl, LV_OBJ_FLAG_HIDDEN);
     }
-
-    for (int i = 0; i < total; i++) {
-        int slot = ((deauthHead - 1 - i) + MAX_DEAUTH) % MAX_DEAUTH;
+    while (deauthRowCount < total) {
+        lv_obj_t *entry = lv_list_add_text(deauthEventList, "");
+        if (!entry) break;
+        lv_obj_set_style_text_color(entry, lv_color_hex(TH.alert), LV_PART_MAIN);
+        deauthRows[deauthRowCount++] = entry;
+    }
+    for (int i = 0; i < deauthRowCount; ++i) {
+        lv_obj_t *entry = deauthRows[i];
+        if (i >= total) {
+            lv_obj_add_flag(entry, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_remove_flag(entry, LV_OBJ_FLAG_HIDDEN);
+        int slot = ((head - 1 - i) + MAX_DEAUTH) % MAX_DEAUTH;
         char row[60];
         snprintf(row, sizeof(row), "Ch%d  %s  %ddBm [R:%d]",
                  deauthLog[slot].channel,
                  deauthLog[slot].src,
                  deauthLog[slot].rssi,
                  deauthLog[slot].reason);
-        lv_obj_t *entry = lv_list_add_text(deauthEventList, row);
-        if (entry)
-            lv_obj_set_style_text_color(entry, lv_color_hex(TH.alert), LV_PART_MAIN);
+        const char *old = lv_label_get_text(entry);
+        if (!old || strcmp(old, row)) lv_label_set_text(entry, row);
     }
 }
 
@@ -9180,13 +9251,17 @@ static void cb_deauthStatsOpen(lv_event_t *e) {
 static bool deauthScanStart() {
     if (!scanSessionIsResume()) {
         deauthTotal = deauthHead = deauthSoundedTotal = 0;
+        deauthGeneration = 0;
         deauthRssiSum = deauthRssiCount = 0;
         deauthStrongestRSSI = -127;
         deauthCurrentRate = deauthLastRateMs = deauthLastRateTotal = 0;
+        deauthPaintedGeneration = UINT32_MAX;
     }
     WiFi.mode(WIFI_STA); WiFi.disconnect();
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_rx_cb(nullptr);
+    wifi_promiscuous_filter_t filter{WIFI_PROMIS_FILTER_MASK_MGMT};
+    esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous_rx_cb(sniffer_cb);
     esp_wifi_set_promiscuous(true);
@@ -9306,10 +9381,12 @@ void createDeauthDetector() {
     lv_obj_set_style_pad_all(deauthEventList,  2, LV_PART_MAIN);
     lv_obj_set_style_pad_row(deauthEventList,  1, LV_PART_MAIN);
 
-    lv_obj_t *initLbl =
-        lv_list_add_text(deauthEventList, "No events yet.");
-    if (initLbl)
-        lv_obj_set_style_text_color(initLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    memset(deauthRows, 0, sizeof(deauthRows));
+    deauthRowCount = 0;
+    deauthPaintedGeneration = UINT32_MAX;
+    deauthEmptyLbl = lv_list_add_text(deauthEventList, "No frames detected yet...");
+    if (deauthEmptyLbl)
+        lv_obj_set_style_text_color(deauthEmptyLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
 
     lv_obj_t *backBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
     lv_obj_t *statsBtn = createActionBtn(wifiToolScreen, "Stats", cb_deauthStatsOpen);
@@ -9891,70 +9968,74 @@ static lv_color_t wifiMapperPointColor(uint8_t pktType, int8_t rssi) {
 
 static void wifiMapperDrawGrid() {
     if (!wifiMapperGridArea) return;
-    lv_obj_clean(wifiMapperGridArea);
-
     const int areaW = SCREEN_W - 12;
-    const int areaH = 82;
+    const int areaH = 62;
     const int leftPad = 20;
     const int topPad = 5;
     const int plotW = areaW - 30;
-    const int plotH = areaH - 18;
+    const int plotH = areaH - 20;
 
-    // Highlight current hopping channel.
     int chX = leftPad + ((int)(wifiMapperChannel - 1) * plotW) / 12;
-    lv_obj_t *hilite = lv_obj_create(wifiMapperGridArea);
-    lv_obj_set_size(hilite, 3, plotH);
-    lv_obj_set_pos(hilite, chX - 1, topPad);
-    lv_obj_set_style_bg_color(hilite, lv_color_hex(TH.accent), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(hilite, LV_OPA_50, LV_PART_MAIN);
-    lv_obj_set_style_border_width(hilite, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(hilite, 1, LV_PART_MAIN);
-    lv_obj_clear_flag(hilite, LV_OBJ_FLAG_SCROLLABLE);
+    if (!wifiMapperGridBuilt) {
+        wifiMapperHighlight = lv_obj_create(wifiMapperGridArea);
+        lv_obj_set_size(wifiMapperHighlight, 3, plotH);
+        lv_obj_set_style_bg_color(wifiMapperHighlight, lv_color_hex(TH.accent), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(wifiMapperHighlight, LV_OPA_50, LV_PART_MAIN);
+        lv_obj_set_style_border_width(wifiMapperHighlight, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(wifiMapperHighlight, 1, LV_PART_MAIN);
+        lv_obj_clear_flag(wifiMapperHighlight, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Vertical channel grid.
-    for (int ch = 1; ch <= 13; ch++) {
-        int x = leftPad + ((ch - 1) * plotW) / 12;
-        lv_obj_t *line = lv_obj_create(wifiMapperGridArea);
-        lv_obj_set_size(line, 1, plotH);
-        lv_obj_set_pos(line, x, topPad);
-        lv_obj_set_style_bg_color(line, lv_color_hex((ch == wifiMapperChannel) ? TH.accent : TH.border), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(line, (ch == wifiMapperChannel) ? LV_OPA_70 : LV_OPA_40, LV_PART_MAIN);
-        lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
-        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+        for (int ch = 1; ch <= 13; ch++) {
+            int x = leftPad + ((ch - 1) * plotW) / 12;
+            lv_obj_t *line = lv_obj_create(wifiMapperGridArea);
+            wifiMapperChannelLines[ch - 1] = line;
+            lv_obj_set_size(line, 1, plotH);
+            lv_obj_set_pos(line, x, topPad);
+            lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
+            lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
 
-        if (ch == 1 || ch == 6 || ch == 11 || ch == 13) {
-            lv_obj_t *lbl = lv_label_create(wifiMapperGridArea);
-            char s[4];
-            snprintf(s, sizeof(s), "%d", ch);
-            lv_label_set_text(lbl, s);
-            lv_obj_set_style_text_color(lbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
-            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, LV_PART_MAIN);
-            lv_obj_set_pos(lbl, x - 3, topPad + plotH + 1);
+            if (ch == 1 || ch == 6 || ch == 11 || ch == 13) {
+                lv_obj_t *lbl = lv_label_create(wifiMapperGridArea);
+                char s[4];
+                snprintf(s, sizeof(s), "%d", ch);
+                lv_label_set_text(lbl, s);
+                lv_obj_set_style_text_color(lbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+                lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, LV_PART_MAIN);
+                lv_obj_set_pos(lbl, x - 3, topPad + plotH + 1);
+            }
         }
+
+        for (int r = WIFI_MAPPER_RSSI_MIN; r <= WIFI_MAPPER_RSSI_MAX; r += 20) {
+            int y = topPad + ((WIFI_MAPPER_RSSI_MAX - r) * plotH) /
+                    (WIFI_MAPPER_RSSI_MAX - WIFI_MAPPER_RSSI_MIN);
+            lv_obj_t *line = lv_obj_create(wifiMapperGridArea);
+            lv_obj_set_size(line, plotW, 1);
+            lv_obj_set_pos(line, leftPad, y);
+            lv_obj_set_style_bg_color(line, lv_color_hex(TH.border), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(line, LV_OPA_40, LV_PART_MAIN);
+            lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
+            lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+
+            if (r == -90 || r == -50 || r == -10) {
+                lv_obj_t *lbl = lv_label_create(wifiMapperGridArea);
+                char s[8];
+                snprintf(s, sizeof(s), "%d", r);
+                lv_label_set_text(lbl, s);
+                lv_obj_set_style_text_color(lbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+                lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, LV_PART_MAIN);
+                lv_obj_set_pos(lbl, 1, y - 6);
+            }
+        }
+        wifiMapperGridBuilt = true;
     }
 
-    // Horizontal RSSI grid: -90, -70, -50, -30, -10.
-    for (int r = WIFI_MAPPER_RSSI_MIN; r <= WIFI_MAPPER_RSSI_MAX; r += 20) {
-        int y = topPad + ((WIFI_MAPPER_RSSI_MAX - r) * plotH) /
-                (WIFI_MAPPER_RSSI_MAX - WIFI_MAPPER_RSSI_MIN);
-
-        lv_obj_t *line = lv_obj_create(wifiMapperGridArea);
-        lv_obj_set_size(line, plotW, 1);
-        lv_obj_set_pos(line, leftPad, y);
-        lv_obj_set_style_bg_color(line, lv_color_hex(TH.border), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(line, LV_OPA_40, LV_PART_MAIN);
-        lv_obj_set_style_border_width(line, 0, LV_PART_MAIN);
-        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
-
-        if (r == -90 || r == -50 || r == -10) {
-            lv_obj_t *lbl = lv_label_create(wifiMapperGridArea);
-            char s[8];
-            snprintf(s, sizeof(s), "%d", r);
-            lv_label_set_text(lbl, s);
-            lv_obj_set_style_text_color(lbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
-            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, LV_PART_MAIN);
-            lv_obj_set_pos(lbl, 1, y - 6);
-        }
+    lv_obj_set_pos(wifiMapperHighlight, chX - 1, topPad);
+    for (int ch = 1; ch <= 13; ++ch) {
+        lv_obj_t *line = wifiMapperChannelLines[ch - 1];
+        lv_obj_set_style_bg_color(line,
+            lv_color_hex((ch == wifiMapperChannel) ? TH.accent : TH.border), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(line,
+            (ch == wifiMapperChannel) ? LV_OPA_70 : LV_OPA_40, LV_PART_MAIN);
     }
 
     // Snapshot the ring indexes. It is fine if a packet arrives while drawing;
@@ -9962,24 +10043,35 @@ static void wifiMapperDrawGrid() {
     uint16_t count = wifiMapperCount;
     uint16_t head = wifiMapperHead;
 
-    for (uint16_t i = 0; i < count; i++) {
+    while (wifiMapperDotCount < count) {
+        lv_obj_t *dot = lv_obj_create(wifiMapperGridArea);
+        lv_obj_set_size(dot, 4, 4);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_width(dot, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+        wifiMapperDots[wifiMapperDotCount++] = dot;
+    }
+    for (uint16_t i = 0; i < wifiMapperDotCount; i++) {
+        lv_obj_t *dot = wifiMapperDots[i];
+        if (i >= count) {
+            lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
         uint16_t idx = (head + WIFI_MAPPER_MAX_POINTS - count + i) % WIFI_MAPPER_MAX_POINTS;
         WiFiMapperPoint p = wifiMapperPoints[idx];
-        if (p.channel < 1 || p.channel > 13) continue;
+        if (p.channel < 1 || p.channel > 13) {
+            lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
 
         int rssi = wifiMapperClampInt(p.rssi, WIFI_MAPPER_RSSI_MIN, WIFI_MAPPER_RSSI_MAX);
         int x = leftPad + ((int)(p.channel - 1) * plotW) / 12;
         int y = topPad + ((WIFI_MAPPER_RSSI_MAX - rssi) * plotH) /
                 (WIFI_MAPPER_RSSI_MAX - WIFI_MAPPER_RSSI_MIN);
-
-        lv_obj_t *dot = lv_obj_create(wifiMapperGridArea);
-        lv_obj_set_size(dot, 4, 4);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_pos(dot, x - 2, y - 2);
         lv_obj_set_style_bg_color(dot, wifiMapperPointColor(p.pktType, p.rssi), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_border_width(dot, 0, LV_PART_MAIN);
-        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
     }
 }
 
@@ -10129,6 +10221,11 @@ void createWiFiMapper() {
     wifiMapperResetPoints();
 
     if (wifiToolScreen) { lv_obj_delete(wifiToolScreen); wifiToolScreen = nullptr; }
+    wifiMapperGridBuilt = false;
+    wifiMapperHighlight = nullptr;
+    memset(wifiMapperChannelLines, 0, sizeof(wifiMapperChannelLines));
+    memset(wifiMapperDots, 0, sizeof(wifiMapperDots));
+    wifiMapperDotCount = 0;
     wifiToolScreen = lv_obj_create(nullptr);
     applyScreenStyle(wifiToolScreen);
     createHeader(wifiToolScreen, LV_SYMBOL_EYE_OPEN "  WiFi Mapper");
@@ -10204,7 +10301,7 @@ void createWiFiMapper() {
 //    2. For each BSSID, check if this SSID has been seen before.
 //    3. If new, increment that BSSID's unique-SSID counter and store it
 //       (up to PINEAP_SSID_SLOTS entries for display).
-//    4. After the scan, count how many BSSIDs have exceeded
+//    4. After the scan, count how many BSSIDs have reached
 //       PINEAP_THRESHOLD unique SSIDs — those are the suspects.
 //    5. Display flagged BSSIDs in red; click for SSID list detail.
 //
@@ -10213,38 +10310,53 @@ void createWiFiMapper() {
 // ════════════════════════════════════════════════════════════════
 static lv_obj_t *pineapStatusLbl = nullptr;
 static lv_obj_t *pineapList      = nullptr;
-static lv_obj_t *pineapBackBtn   = nullptr;   // saved so rebuildPineAPList can rebuild the group
+static lv_obj_t *pineapBackBtn   = nullptr;
 static lv_obj_t *pineapScanBtn   = nullptr;
+static lv_obj_t *pineapRowBtns[MAX_PINEAP_BSSIDS] = {};
+static lv_obj_t *pineapRowLabels[MAX_PINEAP_BSSIDS] = {};
+static lv_obj_t *pineapEmptyLbl = nullptr;
+static int pineapRowCount = 0;
+static char pineapFocusedBssid[18] = {};
 
-static int pineapFocusedIndex() {
-    if (!pineapList || !wifiToolGroup) return -1;
+static void capturePineAPFocus() {
+    pineapFocusedBssid[0] = '\0';
+    if (!wifiToolGroup) return;
     lv_obj_t *focused = lv_group_get_focused(wifiToolGroup);
-    for (int i = 0; i < pineapEntryCount; ++i)
-        if (lv_obj_get_child(pineapList, i) == focused) return i;
-    return -1;
+    for (int i = 0; i < pineapEntryCount && i < pineapRowCount; ++i) {
+        if (pineapRowBtns[i] == focused) {
+            snprintf(pineapFocusedBssid, sizeof(pineapFocusedBssid), "%s",
+                     pineapEntries[i].bssid);
+            return;
+        }
+    }
 }
 
-// Sort pineapEntries by ssidCount descending
-static void sortPineAPBySsidCount() {
+// Put the strongest evidence first, breaking equal counts by signal strength.
+static void sortPineAPSuspects() {
     for (int i = 0; i < pineapEntryCount - 1; i++)
-        for (int j = 0; j < pineapEntryCount - 1 - i; j++)
-            if (pineapEntries[j].ssidCount < pineapEntries[j+1].ssidCount) {
+        for (int j = 0; j < pineapEntryCount - 1 - i; j++) {
+            const bool swap =
+                pineapEntries[j].ssidCount < pineapEntries[j + 1].ssidCount ||
+                (pineapEntries[j].ssidCount == pineapEntries[j + 1].ssidCount &&
+                 pineapEntries[j].lastRSSI < pineapEntries[j + 1].lastRSSI);
+            if (swap) {
                 PineAPEntry tmp    = pineapEntries[j];
                 pineapEntries[j]   = pineapEntries[j+1];
                 pineapEntries[j+1] = tmp;
             }
+        }
 }
 
 // Accumulate one WiFi scan into the BSSID table
 static void accumulatePineAPScan(int n) {
     pineapScanCount++;
+    const uint32_t now = millis();
 
     for (int i = 0; i < n; i++) {
         String bssidStr = WiFi.BSSIDstr(i);
         String ssidStr  = WiFi.SSID(i);
         if (ssidStr.length() == 0) ssidStr = "<hidden>";
         int8_t rssi = (int8_t)WiFi.RSSI(i);
-        scanShouldAlert(bssidStr.c_str());
 
         // Find or create BSSID slot
         int slot = -1;
@@ -10255,11 +10367,16 @@ static void accumulatePineAPScan(int n) {
         }
         if (slot == -1) {
             if (pineapEntryCount >= MAX_PINEAP_BSSIDS) {
-                const int focused = pineapFocusedIndex();
                 slot = -1;
+                uint32_t oldestAge = 0;
                 for (int j = 0; j < pineapEntryCount; ++j) {
-                    if (j == focused) continue;
-                    if (slot < 0 || pineapEntries[j].lastSeen < pineapEntries[slot].lastSeen) slot = j;
+                    if (pineapFocusedBssid[0] &&
+                        strcmp(pineapEntries[j].bssid, pineapFocusedBssid) == 0) continue;
+                    const uint32_t age = now - pineapEntries[j].lastSeen;
+                    if (slot < 0 || age > oldestAge) {
+                        slot = j;
+                        oldestAge = age;
+                    }
                 }
                 if (slot < 0) continue;
                 memset(&pineapEntries[slot], 0, sizeof(pineapEntries[slot]));
@@ -10269,50 +10386,36 @@ static void accumulatePineAPScan(int n) {
             pineapEntries[slot].ssidCount = 0;
         }
         pineapEntries[slot].lastRSSI = rssi;
-        pineapEntries[slot].lastSeen = millis();
+        pineapEntries[slot].lastSeen = now;
 
         // Check if this SSID is already stored for this BSSID
-        int   checkLen = min(pineapEntries[slot].ssidCount, PINEAP_SSID_SLOTS);
+        const int checkLen = pineapEntries[slot].ssidCount;
         bool  known    = false;
         for (int k = 0; k < checkLen; k++) {
             if (ssidStr.equals(pineapEntries[slot].ssids[k])) { known = true; break; }
         }
-        if (!known) {
-            if (pineapEntries[slot].ssidCount < PINEAP_SSID_SLOTS) {
-                strncpy(pineapEntries[slot].ssids[pineapEntries[slot].ssidCount],
+        if (!known && pineapEntries[slot].ssidCount < PINEAP_SSID_SLOTS) {
+            const bool wasFlagged = pineapEntries[slot].ssidCount >= PINEAP_THRESHOLD;
+            strncpy(pineapEntries[slot].ssids[pineapEntries[slot].ssidCount],
                         ssidStr.c_str(), 32);
-                pineapEntries[slot].ssids[pineapEntries[slot].ssidCount][32] = '\0';
-            }
+            pineapEntries[slot].ssids[pineapEntries[slot].ssidCount][32] = '\0';
             pineapEntries[slot].ssidCount++;
+            const bool nowFlagged = pineapEntries[slot].ssidCount >= PINEAP_THRESHOLD;
+            if (!wasFlagged && nowFlagged && scanShouldAlert(pineapEntries[slot].bssid))
+                playDeauthChirp();
         }
     }
     // Re-count flagged BSSIDs and sort
     pineapFlagged = 0;
     for (int j = 0; j < pineapEntryCount; j++)
         if (pineapEntries[j].ssidCount >= PINEAP_THRESHOLD) pineapFlagged++;
-    sortPineAPBySsidCount();
+    sortPineAPSuspects();
 }
 
-// Rebuild the BSSID result list on screen
-static void rebuildPineAPList() {
-    if (!pineapList) return;
-
-    // Rebuild the group BEFORE lv_obj_clean so the old list-button
-    // references are dropped first.  Stale group pointers are the crash.
-    deleteGroup(&wifiToolGroup);
-    wifiToolGroup = lv_group_create();
-    if (pineapBackBtn) lv_group_add_obj(wifiToolGroup, pineapBackBtn);
-    if (pineapScanBtn) lv_group_add_obj(wifiToolGroup, pineapScanBtn);
-    setGroup(wifiToolGroup);
-
-    lv_obj_clean(pineapList);
-
-    if (pineapEntryCount == 0) {
-        lv_obj_t *e = lv_list_add_text(pineapList, "No BSSIDs seen yet.");
-        if (e) lv_obj_set_style_text_color(e, lv_color_hex(TH.textDim), LV_PART_MAIN);
-        return;
-    }
-
+// Update persistent BSSID rows without invalidating encoder focus or group links.
+static void refreshPineAPRows() {
+    if (!pineapList || !wifiToolGroup) return;
+    lv_obj_t *restoreFocus = nullptr;
     for (int i = 0; i < pineapEntryCount; i++) {
         bool flagged = (pineapEntries[i].ssidCount >= PINEAP_THRESHOLD);
 
@@ -10323,28 +10426,52 @@ static void rebuildPineAPList() {
                  pineapEntries[i].ssidCount,
                  pineapEntries[i].lastRSSI);
 
-        lv_obj_t *btn = lv_list_add_btn(pineapList, nullptr, row);
-        styleListBtn(btn);
+        if (i >= pineapRowCount) {
+            lv_obj_t *btn = lv_list_add_btn(pineapList, nullptr, "");
+            pineapRowBtns[i] = btn;
+            pineapRowLabels[i] = lv_obj_get_child(btn, 0);
+            styleListBtn(btn);
+            lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+                scanRequestNavigation(createPineAPDetail,
+                                      (int)(intptr_t)lv_event_get_user_data(ev));
+            }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+            pineapRowCount++;
+        }
+        lv_obj_t *btn = pineapRowBtns[i];
+        lv_label_set_text(pineapRowLabels[i], row);
+        lv_obj_remove_flag(btn, LV_OBJ_FLAG_HIDDEN);
+        if (lv_obj_get_group(btn) != wifiToolGroup) lv_group_add_obj(wifiToolGroup, btn);
 
         // Flagged = red (suspect Pineapple), normal = dim grey
         lv_color_t col = flagged ? lv_color_hex(TH.alert)
                                  : lv_color_hex(TH.textDim);
         lv_obj_set_style_text_color(btn, col, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
-            scanRequestNavigation(createPineAPDetail,
-                                  (int)(intptr_t)lv_event_get_user_data(ev));
-        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        lv_group_add_obj(wifiToolGroup, btn);
+        if (pineapFocusedBssid[0] &&
+            strcmp(pineapFocusedBssid, pineapEntries[i].bssid) == 0) restoreFocus = btn;
     }
+    for (int i = pineapEntryCount; i < pineapRowCount; ++i) {
+        if (lv_obj_get_group(pineapRowBtns[i])) lv_group_remove_obj(pineapRowBtns[i]);
+        lv_obj_add_flag(pineapRowBtns[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    if (!pineapEmptyLbl) {
+        pineapEmptyLbl = lv_list_add_text(pineapList, "No BSSIDs seen yet.");
+        lv_obj_set_style_text_color(pineapEmptyLbl, lv_color_hex(TH.textDim), LV_PART_MAIN);
+    }
+    if (pineapEntryCount == 0) lv_obj_remove_flag(pineapEmptyLbl, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(pineapEmptyLbl, LV_OBJ_FLAG_HIDDEN);
     scanRestoreControls();
+    if (restoreFocus) lv_group_focus_obj(restoreFocus);
+    else if (pineapFocusedBssid[0] && pineapScanBtn) lv_group_focus_obj(pineapScanBtn);
+    pineapFocusedBssid[0] = '\0';
 }
 
 static bool pineapScanStart() {
     if (!scanSessionIsResume()) {
+        capturePineAPFocus();
         memset(pineapEntries, 0, sizeof(pineapEntries));
         pineapEntryCount = pineapScanCount = pineapFlagged = 0;
-        rebuildPineAPList();
+        refreshPineAPRows();
     }
     scanSessionPhase("BSSIDs");
     return liveWifiScanStartCycle();
@@ -10353,9 +10480,10 @@ static bool pineapScanStart() {
 static void pineapScanPoll() {
     const int n = liveWifiScanResult();
     if (n == WIFI_SCAN_RUNNING) return;
+    capturePineAPFocus();
     accumulatePineAPScan(n);
     WiFi.scanDelete();
-    rebuildPineAPList();
+    refreshPineAPRows();
     if (!liveWifiScanStartCycle()) scanSessionError("PineAP scan restart failed");
 }
 
@@ -10373,6 +10501,11 @@ void createPineAPHunter() {
     pineapList       = nullptr;
     pineapBackBtn    = nullptr;
     pineapScanBtn    = nullptr;
+    memset(pineapRowBtns, 0, sizeof(pineapRowBtns));
+    memset(pineapRowLabels, 0, sizeof(pineapRowLabels));
+    pineapRowCount = 0;
+    pineapEmptyLbl = nullptr;
+    pineapFocusedBssid[0] = '\0';
 
     if (wifiToolScreen) { lv_obj_delete(wifiToolScreen); wifiToolScreen = nullptr; }
     wifiToolScreen = lv_obj_create(nullptr);
@@ -10409,6 +10542,7 @@ void createPineAPHunter() {
     attachScanSession(wifiToolScreen, &wifiToolGroup, pineapBackBtn, pineapScanBtn,
                       pineapStatusLbl, "scanPine", (uint32_t)wifiScanSeconds * 1000UL,
                       {pineapScanStart, pineapScanPoll, pineapScanStop, pineapScanResultCount});
+    refreshPineAPRows();
 
     lv_screen_load_anim(wifiToolScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
@@ -11301,6 +11435,15 @@ static void parseNyanBoxManufacturer(BLEAdvertisedDevice &dev, uint16_t &level, 
     }
 }
 
+static bool detectSkimmerName(BLEAdvertisedDevice &dev) {
+    if (!dev.haveName()) return false;
+    String name = dev.getName().c_str();
+    name.trim();
+    for (int i = 0; i < SKIMMER_NAME_MATCH_COUNT; ++i)
+        if (name.equalsIgnoreCase(SKIMMER_NAME_MATCHES[i])) return true;
+    return false;
+}
+
 static BLEDeviceType classifyBleAdvertisement(BLEAdvertisedDevice &dev) {
     if (detectFlipper(dev)) return BLE_FLIPPER;
     if (detectNyanBox(dev)) return BLE_NYANBOX;
@@ -11309,36 +11452,8 @@ static BLEDeviceType classifyBleAdvertisement(BLEAdvertisedDevice &dev) {
     if (detectAirTag(dev)) return BLE_AIRTAG;
     if (detectApple(dev)) return BLE_APPLE;
     if (detectMeta(dev)) return BLE_META;
-    if (dev.haveName()) {
-        String name = dev.getName().c_str();
-        name.trim();
-        for (int i = 0; i < SKIMMER_NAME_MATCH_COUNT; ++i) {
-            if (name.equalsIgnoreCase(SKIMMER_NAME_MATCHES[i])) return BLE_SKIMMER;
-        }
-    }
+    if (detectSkimmerName(dev)) return BLE_SKIMMER;
     return BLE_GENERIC;
-}
-
-static bool liveBleModeMatches(LiveBleMode mode, BLEDeviceType type,
-                               BLEAdvertisedDevice &dev) {
-    switch (mode) {
-        case LiveBleMode::Generic: return true;
-        case LiveBleMode::AirTag:  return type == BLE_AIRTAG;
-        case LiveBleMode::Flipper: return type == BLE_FLIPPER;
-        case LiveBleMode::NyanBox: return type == BLE_NYANBOX;
-        case LiveBleMode::Axon:    return type == BLE_AXON;
-        case LiveBleMode::Raven:   return detectRaven(dev);
-        case LiveBleMode::Charger: {
-            char method[24];
-            char uuid[41];
-            uint8_t confidence = 0;
-            return detectSmartCharger(dev, method, sizeof(method), uuid, sizeof(uuid), &confidence);
-        }
-        case LiveBleMode::Tesla:   return type == BLE_TESLA;
-        case LiveBleMode::Skimmer: return type == BLE_SKIMMER;
-        case LiveBleMode::Meta:    return type == BLE_META;
-    }
-    return false;
 }
 
 static void liveBleMailboxPush(const LiveBleObservation &observation) {
@@ -11384,17 +11499,61 @@ static bool liveBleMailboxPop(LiveBleObservation &observation) {
 
 static void liveBleAdvertisement(BLEAdvertisedDevice &dev, void *context) {
     LiveBleMode mode = *static_cast<LiveBleMode *>(context);
-    const BLEDeviceType type = classifyBleAdvertisement(dev);
-    if (!liveBleModeMatches(mode, type, dev)) return;
-
     LiveBleObservation observation{};
     observation.mode = mode;
-    observation.type = type;
     observation.addressType = static_cast<uint8_t>(dev.getAddressType());
     observation.rssi = static_cast<int8_t>(dev.getRSSI());
     observation.seenMs = millis();
 
-    String mac = dev.getAddress().toString().c_str();
+    // Raven and Charger are outside the generic type enum, so run their
+    // detector once and retain its parsed fields. Enum-filtered tools keep
+    // the generic classifier's established precedence.
+    switch (mode) {
+        case LiveBleMode::Generic:
+            observation.type = classifyBleAdvertisement(dev);
+            break;
+        case LiveBleMode::AirTag:
+            observation.type = classifyBleAdvertisement(dev);
+            if (observation.type != BLE_AIRTAG) return;
+            break;
+        case LiveBleMode::Flipper:
+            observation.type = classifyBleAdvertisement(dev);
+            if (observation.type != BLE_FLIPPER) return;
+            break;
+        case LiveBleMode::NyanBox:
+            observation.type = classifyBleAdvertisement(dev);
+            if (observation.type != BLE_NYANBOX) return;
+            break;
+        case LiveBleMode::Axon:
+            observation.type = classifyBleAdvertisement(dev);
+            if (observation.type != BLE_AXON) return;
+            break;
+        case LiveBleMode::Raven:
+            observation.ravenUuidHits = ravenCountUuidHits(
+                dev, observation.ravenUuid, sizeof(observation.ravenUuid));
+            if (!observation.ravenUuidHits) return;
+            break;
+        case LiveBleMode::Charger:
+            if (!detectSmartCharger(dev,
+                                    observation.chargerMethod, sizeof(observation.chargerMethod),
+                                    observation.chargerUuid, sizeof(observation.chargerUuid),
+                                    &observation.chargerConfidence)) return;
+            break;
+        case LiveBleMode::Tesla:
+            observation.type = classifyBleAdvertisement(dev);
+            if (observation.type != BLE_TESLA) return;
+            break;
+        case LiveBleMode::Skimmer:
+        case LiveBleMode::Meta: {
+            const BLEDeviceType type = classifyBleAdvertisement(dev);
+            if ((mode == LiveBleMode::Skimmer && type != BLE_SKIMMER) ||
+                (mode == LiveBleMode::Meta && type != BLE_META)) return;
+            observation.type = type;
+            break;
+        }
+    }
+
+    const auto mac = dev.getAddress().toString();
     strncpy(observation.mac, mac.c_str(), sizeof(observation.mac) - 1);
     const char *fallback = "<unknown>";
     if (mode == LiveBleMode::NyanBox) fallback = "Unknown";
@@ -11402,12 +11561,16 @@ static void liveBleAdvertisement(BLEAdvertisedDevice &dev, void *context) {
     else if (mode == LiveBleMode::Raven) fallback = "Raven Device";
     else if (mode == LiveBleMode::Charger) fallback = "Smart Charger";
     else if (mode == LiveBleMode::Tesla) fallback = "Tesla BLE";
-    String name = dev.haveName() ? dev.getName().c_str() : fallback;
     observation.hasName = dev.haveName();
     observation.hasManufacturer = dev.haveManufacturerData();
-    strncpy(observation.name, name.c_str(), sizeof(observation.name) - 1);
+    if (observation.hasName) {
+        const auto name = dev.getName();
+        strncpy(observation.name, name.c_str(), sizeof(observation.name) - 1);
+    } else {
+        strncpy(observation.name, fallback, sizeof(observation.name) - 1);
+    }
 
-    if (type == BLE_FLIPPER) {
+    if (observation.type == BLE_FLIPPER) {
         strncpy(observation.flipperColor, detectFlipperColor(dev),
                 sizeof(observation.flipperColor) - 1);
     }
@@ -11416,15 +11579,9 @@ static void liveBleAdvertisement(BLEAdvertisedDevice &dev, void *context) {
                                  observation.nyanVersion,
                                  sizeof(observation.nyanVersion));
     } else if (mode == LiveBleMode::Raven) {
-        observation.ravenUuidHits = ravenCountUuidHits(
-            dev, observation.ravenUuid, sizeof(observation.ravenUuid));
         strncpy(observation.ravenFw, estimateRavenFW(dev),
                 sizeof(observation.ravenFw) - 1);
     } else if (mode == LiveBleMode::Charger) {
-        detectSmartCharger(dev,
-                           observation.chargerMethod, sizeof(observation.chargerMethod),
-                           observation.chargerUuid, sizeof(observation.chargerUuid),
-                           &observation.chargerConfidence);
         chargerManufacturerPreview(dev, observation.chargerMfg,
                                    sizeof(observation.chargerMfg));
     }
@@ -11474,15 +11631,16 @@ static bool applyLiveBleObservation(const LiveBleObservation &o) {
             if (bleEntries[i].addressType == o.addressType &&
                 strcmp(bleEntries[i].mac, o.mac) == 0) { idx = i; break; }
         }
-        const bool added = idx < 0;
+        const bool newIdentity = idx < 0;
+        bool grew = false;
         if (idx < 0) {
-            if (bleEntryCount < MAX_BLE_RESULTS) idx = bleEntryCount++;
+            if (bleEntryCount < MAX_BLE_RESULTS) { idx = bleEntryCount++; grew = true; }
             else idx = oldestLiveBleIndex(liveBleEntryLastSeen, bleEntryCount);
         }
         if (idx < 0) return false;
         BLEEntry &entry = bleEntries[idx];
-        if (added) memset(&entry, 0, sizeof(entry));
-        if (added || o.hasName) strncpy(entry.name, o.name, sizeof(entry.name) - 1);
+        if (newIdentity) memset(&entry, 0, sizeof(entry));
+        if (newIdentity || o.hasName) strncpy(entry.name, o.name, sizeof(entry.name) - 1);
         strncpy(entry.mac, o.mac, sizeof(entry.mac) - 1);
         entry.addressType = o.addressType;
         entry.rssi = o.rssi;
@@ -11491,7 +11649,7 @@ static bool applyLiveBleObservation(const LiveBleObservation &o) {
         strncpy(entry.mfgHint, mfgHintStr(o.type), sizeof(entry.mfgHint) - 1);
         strncpy(entry.flipperColor, o.flipperColor, sizeof(entry.flipperColor) - 1);
         liveBleEntryLastSeen[idx] = o.seenMs;
-        return added;
+        return grew;
     }
 
     if (o.mode == LiveBleMode::NyanBox) {
@@ -11499,9 +11657,10 @@ static bool applyLiveBleObservation(const LiveBleObservation &o) {
         for (int i = 0; i < nyanEntryCount; ++i)
             if (nyanEntries[i].addressType == o.addressType &&
                 strcmp(nyanEntries[i].mac, o.mac) == 0) { idx = i; break; }
-        const bool added = idx < 0;
+        const bool newIdentity = idx < 0;
+        bool grew = false;
         if (idx < 0) {
-            if (nyanEntryCount < MAX_NYANBOX_RESULTS) idx = nyanEntryCount++;
+            if (nyanEntryCount < MAX_NYANBOX_RESULTS) { idx = nyanEntryCount++; grew = true; }
             else {
                 idx = liveBleProtectedIndex == 0 ? 1 : 0;
                 if (idx >= nyanEntryCount) return false;
@@ -11511,16 +11670,16 @@ static bool applyLiveBleObservation(const LiveBleObservation &o) {
             }
         }
         NyanBoxEntry &entry = nyanEntries[idx];
-        if (added) memset(&entry, 0, sizeof(entry));
-        if (added || o.hasName) strncpy(entry.name, o.name, sizeof(entry.name) - 1);
+        if (newIdentity) memset(&entry, 0, sizeof(entry));
+        if (newIdentity || o.hasName) strncpy(entry.name, o.name, sizeof(entry.name) - 1);
         strncpy(entry.mac, o.mac, sizeof(entry.mac) - 1);
         entry.addressType = o.addressType;
         entry.rssi = o.rssi; entry.lastSeen = o.seenMs;
-        if (added || o.hasManufacturer) {
+        if (newIdentity || o.hasManufacturer) {
             entry.level = o.nyanLevel;
             strncpy(entry.version, o.nyanVersion, sizeof(entry.version) - 1);
         }
-        return added;
+        return grew;
     }
 
     if (o.mode == LiveBleMode::Axon) {
@@ -11528,9 +11687,10 @@ static bool applyLiveBleObservation(const LiveBleObservation &o) {
         for (int i = 0; i < axonEntryCount; ++i)
             if (axonEntries[i].addressType == o.addressType &&
                 strcmp(axonEntries[i].mac, o.mac) == 0) { idx = i; break; }
-        const bool added = idx < 0;
+        const bool newIdentity = idx < 0;
+        bool grew = false;
         if (idx < 0) {
-            if (axonEntryCount < MAX_AXON_RESULTS) idx = axonEntryCount++;
+            if (axonEntryCount < MAX_AXON_RESULTS) { idx = axonEntryCount++; grew = true; }
             else {
                 idx = liveBleProtectedIndex == 0 ? 1 : 0;
                 if (idx >= axonEntryCount) return false;
@@ -11540,21 +11700,22 @@ static bool applyLiveBleObservation(const LiveBleObservation &o) {
             }
         }
         AxonEntry &entry = axonEntries[idx];
-        if (added) memset(&entry, 0, sizeof(entry));
-        if (added || o.hasName) strncpy(entry.name, o.name, sizeof(entry.name) - 1);
+        if (newIdentity) memset(&entry, 0, sizeof(entry));
+        if (newIdentity || o.hasName) strncpy(entry.name, o.name, sizeof(entry.name) - 1);
         strncpy(entry.mac, o.mac, sizeof(entry.mac) - 1);
         entry.addressType = o.addressType;
         entry.rssi = o.rssi; entry.lastSeen = o.seenMs;
-        return added;
+        return grew;
     }
 
 #define LIVE_BLE_UPSERT_SPECIAL(ARRAY, COUNT, MAX_COUNT, TYPE) \
     int idx = -1; \
     for (int i = 0; i < COUNT; ++i) \
         if (ARRAY[i].addressType == o.addressType && strcmp(ARRAY[i].mac, o.mac) == 0) { idx = i; break; } \
-    const bool added = idx < 0; \
+    const bool newIdentity = idx < 0; \
+    bool grew = false; \
     if (idx < 0) { \
-        if (COUNT < MAX_COUNT) idx = COUNT++; \
+        if (COUNT < MAX_COUNT) { idx = COUNT++; grew = true; } \
         else { \
             idx = liveBleProtectedIndex == 0 ? 1 : 0; \
             if (idx >= COUNT) return false; \
@@ -11564,8 +11725,8 @@ static bool applyLiveBleObservation(const LiveBleObservation &o) {
         } \
     } \
     TYPE &entry = ARRAY[idx]; \
-    if (added) memset(&entry, 0, sizeof(entry)); \
-    if (added || o.hasName) strncpy(entry.name, o.name, sizeof(entry.name) - 1); \
+    if (newIdentity) memset(&entry, 0, sizeof(entry)); \
+    if (newIdentity || o.hasName) strncpy(entry.name, o.name, sizeof(entry.name) - 1); \
     strncpy(entry.mac, o.mac, sizeof(entry.mac) - 1); \
     entry.addressType = o.addressType; \
     entry.rssi = o.rssi; entry.lastSeen = o.seenMs
@@ -11576,24 +11737,24 @@ static bool applyLiveBleObservation(const LiveBleObservation &o) {
                 sizeof(entry.matchedUuid) - 1);
         strncpy(entry.fwEstimate, o.ravenFw, sizeof(entry.fwEstimate) - 1);
         entry.uuidHitCount = o.ravenUuidHits;
-        return added;
+        return grew;
     }
     if (o.mode == LiveBleMode::Charger) {
         LIVE_BLE_UPSERT_SPECIAL(chargerEntries, chargerEntryCount, MAX_CHARGER_RESULTS, SmartChargerEntry);
         strncpy(entry.matchMethod, o.chargerMethod[0] ? o.chargerMethod : "Unknown",
                 sizeof(entry.matchMethod) - 1);
-        if (added || o.chargerUuid[0]) {
+        if (newIdentity || o.chargerUuid[0]) {
             strncpy(entry.advUuid, o.chargerUuid[0] ? o.chargerUuid : "not advertised",
                     sizeof(entry.advUuid) - 1);
         }
-        if (added || o.hasManufacturer)
+        if (newIdentity || o.hasManufacturer)
             strncpy(entry.mfgPreview, o.chargerMfg, sizeof(entry.mfgPreview) - 1);
         if (o.chargerConfidence > entry.confidence) entry.confidence = o.chargerConfidence;
-        return added;
+        return grew;
     }
     if (o.mode == LiveBleMode::Tesla) {
         LIVE_BLE_UPSERT_SPECIAL(teslaEntries, teslaEntryCount, MAX_TESLA_RESULTS, TeslaEntry);
-        return added;
+        return grew;
     }
 #undef LIVE_BLE_UPSERT_SPECIAL
     return false;
@@ -11632,9 +11793,9 @@ static void pollLiveBleScan() {
     }
 
     LiveBleObservation observation;
-    while (liveBleMailboxPop(observation)) {
-        const bool added = applyLiveBleObservation(observation);
-        liveBleResultsDirty = liveBleResultsDirty || added;
+    for (uint8_t processed = 0; processed < 8 && liveBleMailboxPop(observation); ++processed) {
+        const bool grew = applyLiveBleObservation(observation);
+        liveBleResultsDirty = liveBleResultsDirty || grew;
 
         char alertKey[32];
         snprintf(alertKey, sizeof(alertKey), "ble:%u:%u:%s",
@@ -12056,8 +12217,8 @@ static const char *pwnDeviceType(const PwnEntry &e) {
 static int pwnFocusedIndex() {
     if (!pwnList || !wifiToolGroup) return -1;
     lv_obj_t *focused = lv_group_get_focused(wifiToolGroup);
-    for (int i = 0; i < pwnCount; ++i) {
-        if (lv_obj_get_child(pwnList, i) == focused) return i;
+    for (int i = 0; i < pwnCount && i < pwnRowCount; ++i) {
+        if (pwnRowBtns[i] == focused) return i;
     }
     return -1;
 }
@@ -12087,9 +12248,11 @@ static void processPwnPending() {
     bool minigotchi = pwnJsonBool(ssid, "minigotchi");
     const bool shouldAlert = scanShouldAlert(bssid);
 
-    // Update existing entry by name, or add new one
+    // BSSID is the stable radio identity. Names are user-controlled and are
+    // not unique, so two devices advertising the same name stay separate.
     for (int i = 0; i < pwnCount; i++) {
-        if (strcmp(pwnEntries[i].name, name) == 0) {
+        if (strcmp(pwnEntries[i].bssid, bssid) == 0) {
+            snprintf(pwnEntries[i].name, sizeof(pwnEntries[i].name), "%s", name);
             pwnEntries[i].rssi       = rssi;
             pwnEntries[i].channel    = ch;
             pwnEntries[i].pwnd_tot   = pwnd;
@@ -12098,6 +12261,7 @@ static void processPwnPending() {
             strncpy(pwnEntries[i].rawJson, ssid, sizeof(pwnEntries[i].rawJson) - 1);
             pwnEntries[i].rawJson[sizeof(pwnEntries[i].rawJson) - 1] = '\0';
             pwnEntries[i].lastSeen   = millis();
+            pwnListDirty = true;
             if (shouldAlert) playPwnagotchiChirp();
             return;
         }
@@ -12127,6 +12291,7 @@ static void processPwnPending() {
     strncpy(pwnEntries[slot].rawJson, ssid, sizeof(pwnEntries[slot].rawJson) - 1);
     pwnEntries[slot].rawJson[sizeof(pwnEntries[slot].rawJson) - 1] = '\0';
     pwnEntries[slot].lastSeen = millis();
+    pwnListDirty = true;
     if (shouldAlert) playPwnagotchiChirp();
 }
 
@@ -12155,24 +12320,41 @@ static void pwn_refresh_cb(lv_timer_t *) {
             lv_color_hex(TH.alert), LV_PART_MAIN);
     }
 
-    // Rebuild list and encoder group so results are selectable.
-    deleteGroup(&wifiToolGroup);
-    wifiToolGroup = lv_group_create();
-    if (pwnBackBtn) lv_group_add_obj(wifiToolGroup, pwnBackBtn);
-    if (pwnStartBtn) lv_group_add_obj(wifiToolGroup, pwnStartBtn);
+    const uint32_t paintSecond = millis() / 1000UL;
+    if (!pwnListDirty && paintSecond == pwnLastPaintSecond) return;
+    pwnLastPaintSecond = paintSecond;
 
-    lv_obj_clean(pwnList);
+    // Grow/shrink only when the entry count changes. Existing rows stay alive,
+    // preserving encoder focus and avoiding periodic LVGL heap churn.
+    while (pwnRowCount > pwnCount) {
+        const int i = --pwnRowCount;
+        if (pwnRowBtns[i]) lv_obj_delete(pwnRowBtns[i]);
+        pwnRowBtns[i] = pwnRowLabels[i] = nullptr;
+    }
     if (pwnCount == 0) {
-        lv_obj_t *e = lv_list_add_text(pwnList,
-            "No matching beacons yet.");
-        if (e) lv_obj_set_style_text_color(e,
-                    lv_color_hex(TH.textDim), LV_PART_MAIN);
-        scanRestoreControls();
-        setGroup(wifiToolGroup);
+        if (pwnEmptyLbl) lv_obj_remove_flag(pwnEmptyLbl, LV_OBJ_FLAG_HIDDEN);
+        pwnListDirty = false;
         return;
     }
+    if (pwnEmptyLbl) lv_obj_add_flag(pwnEmptyLbl, LV_OBJ_FLAG_HIDDEN);
 
-    for (int i = 0; i < pwnCount; i++) {
+    while (pwnRowCount < pwnCount) {
+        const int i = pwnRowCount;
+        lv_obj_t *btn = lv_list_add_btn(pwnList, nullptr, "");
+        if (!btn) break;
+        styleListBtn(btn);
+        lv_obj_set_style_text_color(btn, lv_color_hex(TH.alert),
+                                    LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+            scanRequestNavigation(createPwnagotchiDetail,
+                                  (int)(intptr_t)lv_event_get_user_data(ev));
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        pwnRowBtns[i] = btn;
+        pwnRowLabels[i] = lv_obj_get_child(btn, 0);
+        if (wifiToolGroup) lv_group_add_obj(wifiToolGroup, btn);
+        ++pwnRowCount;
+    }
+    for (int i = 0; i < pwnRowCount; i++) {
         uint32_t ageSec = (millis() - pwnEntries[i].lastSeen) / 1000;
         char row[80];
         snprintf(row, sizeof(row), "%s  %s  Ch%d  %ddBm  %d pwnd  %lus",
@@ -12182,27 +12364,23 @@ static void pwn_refresh_cb(lv_timer_t *) {
                  pwnEntries[i].rssi,
                  pwnEntries[i].pwnd_tot,
                  (unsigned long)ageSec);
-        lv_obj_t *btn = lv_list_add_btn(pwnList, nullptr, row);
-        styleListBtn(btn);
-        lv_obj_set_style_text_color(btn, lv_color_hex(TH.alert),
-                                    LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
-            scanRequestNavigation(createPwnagotchiDetail,
-                                  (int)(intptr_t)lv_event_get_user_data(ev));
-        }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-        lv_group_add_obj(wifiToolGroup, btn);
+        const char *old = pwnRowLabels[i] ? lv_label_get_text(pwnRowLabels[i]) : nullptr;
+        if (pwnRowLabels[i] && (!old || strcmp(old, row)))
+            lv_label_set_text(pwnRowLabels[i], row);
     }
-    scanRestoreControls();
-    setGroup(wifiToolGroup);
+    pwnListDirty = false;
 }
 
 static bool pwnScanStart() {
     if (!scanSessionIsResume()) {
         pwnCount = 0; pwnPendingReady = false;
         memset(pwnEntries, 0, sizeof(pwnEntries));
+        pwnListDirty = true;
     }
     WiFi.mode(WIFI_STA); WiFi.disconnect();
     esp_wifi_set_promiscuous(false); esp_wifi_set_promiscuous_rx_cb(nullptr);
+    wifi_promiscuous_filter_t filter{WIFI_PROMIS_FILTER_MASK_MGMT};
+    esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous_rx_cb(pwn_sniffer_cb);
     esp_wifi_set_promiscuous(true);
@@ -12311,6 +12489,12 @@ void createPwnagotchiDetector() {
     pwnList         = nullptr;
     pwnBackBtn      = nullptr;
     pwnStartBtn     = nullptr;
+    pwnEmptyLbl     = nullptr;
+    pwnRowCount     = 0;
+    pwnListDirty    = true;
+    pwnLastPaintSecond = UINT32_MAX;
+    memset(pwnRowBtns, 0, sizeof(pwnRowBtns));
+    memset(pwnRowLabels, 0, sizeof(pwnRowLabels));
     memset(pwnEntries, 0, sizeof(pwnEntries));
 
     if (wifiToolScreen) { lv_obj_delete(wifiToolScreen); wifiToolScreen = nullptr; }
@@ -12335,10 +12519,9 @@ void createPwnagotchiDetector() {
     lv_obj_set_style_pad_all(pwnList,      2, LV_PART_MAIN);
     lv_obj_set_style_pad_row(pwnList,      1, LV_PART_MAIN);
 
-    lv_obj_t *initLbl =
-        lv_list_add_text(pwnList, "No matching beacons yet.");
-    if (initLbl)
-        lv_obj_set_style_text_color(initLbl,
+    pwnEmptyLbl = lv_list_add_text(pwnList, "No matching beacons yet.");
+    if (pwnEmptyLbl)
+        lv_obj_set_style_text_color(pwnEmptyLbl,
             lv_color_hex(TH.textDim), LV_PART_MAIN);
 
     pwnBackBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
@@ -12363,85 +12546,14 @@ void createPwnagotchiDetector() {
 //  TOOL 7 – FLOCK SAFETY DETECTOR
 //
 //  Flock/Penguin-style devices can beacon / probe with SSIDs containing
-//  Flock-related keywords. We sniff beacon frames (mgmt subtype 8),
-//  probe responses (5), and probe requests (4), parse the SSID IE,
-//  and alert on configured case-insensitive keyword matches. Alerts are
-//  latching — stays red until you navigate back. Hops all 2.4 GHz channels.
-//  Reference: github.com/GainSec/Flock-Safety-Trap-Shooter-Sniffer-Alarm
+//  Passive management/data address roles, probe fingerprints and SSID
+//  evidence. Confidence and source provenance: docs/FLOCK_DETECTION.md.
+//  Hint-only matches stay visible without triggering detection alerts.
 // ════════════════════════════════════════════════════════════════
 static lv_obj_t *flockStatusLbl = nullptr;
 static lv_obj_t *flockList      = nullptr;
 static lv_obj_t *flockBackBtn   = nullptr;
 static lv_obj_t *flockStartBtn  = nullptr;
-
-// Small IRAM-safe helpers for case-insensitive keyword matching.
-// Avoids strstr/strcasecmp inside the promiscuous sniffer callback.
-static char IRAM_ATTR flockToLower(char c) {
-    if (c >= 'A' && c <= 'Z') return c + 32;
-    return c;
-}
-
-static bool IRAM_ATTR flockContainsKeyword(const char *ssid, const char *keyword) {
-    if (!ssid || !keyword || !keyword[0]) return false;
-
-    for (int i = 0; ssid[i]; i++) {
-        int j = 0;
-        while (keyword[j] && ssid[i + j] &&
-               flockToLower(ssid[i + j]) == flockToLower(keyword[j])) {
-            j++;
-        }
-        if (keyword[j] == '\0') return true;
-    }
-    return false;
-}
-
-static bool IRAM_ATTR flockStartsWithNoCase(const char *text, const char *prefix) {
-    if (!text || !prefix) return false;
-    for (int i = 0; prefix[i]; i++) {
-        if (!text[i]) return false;
-        if (flockToLower(text[i]) != flockToLower(prefix[i])) return false;
-    }
-    return true;
-}
-
-static bool IRAM_ATTR flockIsHexChar(char c) {
-    return (c >= '0' && c <= '9') ||
-           (c >= 'a' && c <= 'f') ||
-           (c >= 'A' && c <= 'F');
-}
-
-// Strong Flock SSID/name pattern: Flock-XXXX where XXXX are hex-style ID chars.
-// Kept intentionally simple/fast so it is safe to call from sniffer paths.
-static bool IRAM_ATTR flockHasStrictIdPattern(const char *ssid) {
-#if FLOCK_STRICT_ID_PATTERN_ENABLED
-    if (!ssid) return false;
-    if (!flockStartsWithNoCase(ssid, "Flock-")) return false;
-
-    int count = 0;
-    const char *p = ssid + 6;
-    while (*p && flockIsHexChar(*p)) {
-        count++;
-        p++;
-    }
-    return count >= FLOCK_STRICT_ID_MIN_HEX_CHARS;
-#else
-    return false;
-#endif
-}
-
-static bool IRAM_ATTR containsFlockKeyword(const char *ssid) {
-    return flockHasStrictIdPattern(ssid) ||
-           flockContainsKeyword(ssid, FLOCK_KEYWORD_1) ||
-           flockContainsKeyword(ssid, FLOCK_KEYWORD_2) ||
-           flockContainsKeyword(ssid, FLOCK_KEYWORD_3) ||
-           flockContainsKeyword(ssid, FLOCK_KEYWORD_4) ||
-           flockContainsKeyword(ssid, FLOCK_KEYWORD_5) ||
-           flockContainsKeyword(ssid, FLOCK_KEYWORD_6) ||
-           flockContainsKeyword(ssid, FLOCK_KEYWORD_7) ||
-           flockContainsKeyword(ssid, FLOCK_KEYWORD_8) ||
-           flockContainsKeyword(ssid, FLOCK_KEYWORD_9);
-}
-
 
 static uint16_t flockAdaptiveDwellMs(uint8_t channel, uint16_t baseMs) {
 #if FLOCK_ADAPTIVE_DWELL_ENABLED
@@ -12454,280 +12566,111 @@ static uint16_t flockAdaptiveDwellMs(uint8_t channel, uint16_t baseMs) {
 #endif
 }
 
-// Expanded Flock / SoundThinking MAC-prefix helpers.
-// Prefixes are lowercase 3-byte OUIs in "xx:xx:xx" form.
-static const char *FLOCK_HIGH_MAC_PREFIXES[] = {
-    "58:8e:81", "cc:cc:cc", "ec:1b:bd", "90:35:ea", "04:0d:84",
-    "f0:82:c0", "1c:34:f1", "38:5b:44", "94:34:69", "b4:e3:f9",
-    "70:c9:4e", "3c:91:80", "d8:f3:bc", "80:30:49", "14:5a:fc",
-    "74:4c:a1", "08:3a:88", "9c:2f:9d", "94:08:53", "e4:aa:ea",
-    "b4:1e:52"
-};
-static const char *FLOCK_MFR_MAC_PREFIXES[] = {
-    "f4:6a:dd", "f8:a2:d6", "e0:0a:f6", "00:f4:8d", "d0:39:57", "e8:d0:fc"
-};
-static const char *SOUNDTHINKING_MAC_PREFIXES[] = {
-    "d4:11:d6"
-};
-
-static char flockLowerAscii(char c) {
-    if (c >= 'A' && c <= 'Z') return c + 32;
-    return c;
+static void enqueueFlockWifiFrame(void *buf, wifi_promiscuous_pkt_type_t type, FlockQueue &queue) {
+    if (!buf || (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA)) return;
+    const auto *pkt = reinterpret_cast<const wifi_promiscuous_pkt_t *>(buf);
+    if (pkt->rx_ctrl.sig_len < 4) return;
+    rogue_radar::FlockWifiClassification result{};
+    // ESP32 sig_len includes the four-byte FCS; do not parse it as an IE.
+    rogue_radar::classifyFlockWifiFrame(pkt->payload, pkt->rx_ctrl.sig_len - 4,
+                                      pkt->rx_ctrl.rssi, pkt->rx_ctrl.channel, result);
+    for (unsigned i = 0; i < result.count; ++i) {
+        const auto &match = result.hits[i];
+        rogue_radar::FlockObservation hit;
+        snprintf(hit.mac, sizeof(hit.mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 match.mac[0], match.mac[1], match.mac[2], match.mac[3], match.mac[4], match.mac[5]);
+        snprintf(hit.name, sizeof(hit.name), "%s", match.ssid[0] ? match.ssid : "<hidden/none>");
+        snprintf(hit.method, sizeof(hit.method), "%s", rogue_radar::flockWifiEvidenceLabel(match.evidence));
+        snprintf(hit.confidence, sizeof(hit.confidence), "%s", rogue_radar::flockWifiConfidenceLabel(match.confidence));
+        snprintf(hit.type, sizeof(hit.type), "Flock candidate");
+        hit.receiverOnly = !match.rssiAppliesToDevice;
+        hit.rssi = hit.receiverOnly ? -127 : match.receivedRssi;
+        hit.frame = uint8_t(match.frame);
+        hit.seenMs = millis();
+        pushFlockQueue(queue, hit);
+    }
 }
-
-static bool flockPrefixEquals(const char *mac, const char *prefix) {
-    if (!mac || !prefix) return false;
-    for (int i = 0; i < 8; i++) {
-        if (!mac[i] || !prefix[i]) return false;
-        if (flockLowerAscii(mac[i]) != flockLowerAscii(prefix[i])) return false;
-    }
-    return true;
-}
-
-static bool flockMacInList(const char *mac, const char **list, size_t count) {
-    for (size_t i = 0; i < count; i++) {
-        if (flockPrefixEquals(mac, list[i])) return true;
-    }
-    return false;
-}
-
-static bool classifyFlockMac(const char *mac, char *method, size_t methodLen,
-                             char *confidence, size_t confidenceLen,
-                             char *type, size_t typeLen) {
-#if FLOCK_MAC_PREFIX_MATCH_ENABLED
-    if (flockMacInList(mac, FLOCK_HIGH_MAC_PREFIXES, sizeof(FLOCK_HIGH_MAC_PREFIXES) / sizeof(FLOCK_HIGH_MAC_PREFIXES[0]))) {
-        snprintf(method, methodLen, "MAC Prefix");
-        snprintf(confidence, confidenceLen, "High");
-        snprintf(type, typeLen, "Flock");
-        return true;
-    }
-    if (flockMacInList(mac, SOUNDTHINKING_MAC_PREFIXES, sizeof(SOUNDTHINKING_MAC_PREFIXES) / sizeof(SOUNDTHINKING_MAC_PREFIXES[0]))) {
-        snprintf(method, methodLen, "MAC Prefix");
-        snprintf(confidence, confidenceLen, "High");
-        snprintf(type, typeLen, "SoundThinking");
-        return true;
-    }
-    if (flockMacInList(mac, FLOCK_MFR_MAC_PREFIXES, sizeof(FLOCK_MFR_MAC_PREFIXES) / sizeof(FLOCK_MFR_MAC_PREFIXES[0]))) {
-        snprintf(method, methodLen, "MFR Prefix");
-        snprintf(confidence, confidenceLen, "Low");
-        snprintf(type, typeLen, "Flock MFR");
-        return true;
-    }
-#endif
-    return false;
-}
-
-static void classifyFlockNameHit(const char *ssid,
-                                 char *method, size_t methodLen,
-                                 char *confidence, size_t confidenceLen,
-                                 char *type, size_t typeLen) {
-    if (flockHasStrictIdPattern(ssid)) {
-        snprintf(method, methodLen, "Flock-ID");
-        snprintf(confidence, confidenceLen, "High");
-        snprintf(type, typeLen, "Flock");
-        return;
-    }
-
-    snprintf(method, methodLen, "Name");
-    snprintf(confidence, confidenceLen, "High");
-    snprintf(type, typeLen, "Flock");
-}
-
-static void IRAM_ATTR flock_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
-    if (!flockActive || type != WIFI_PKT_MGMT || flockPendingReady) return;
-
-    const wifi_promiscuous_pkt_t *pkt =
-        reinterpret_cast<const wifi_promiscuous_pkt_t *>(buf);
-    const uint8_t *d = pkt->payload;
-    int len = pkt->rx_ctrl.sig_len;
-
-    if (len < 24) return;
-
-    uint8_t fc0    = d[0];
-    uint8_t ftype  = (fc0 >> 2) & 0x03;
-    uint8_t stype  = (fc0 >> 4) & 0x0F;
-
-    if (ftype != 0) return;
-    if (stype != 8 && stype != 5 && stype != 4) return;
-
-    char src[18];
-    snprintf(src, sizeof(src), "%02X:%02X:%02X:%02X:%02X:%02X",
-             d[10], d[11], d[12], d[13], d[14], d[15]);
-
-    char method[18] = "";
-    char confidence[8] = "";
-    char deviceType[20] = "";
-    bool macHit = classifyFlockMac(src, method, sizeof(method), confidence, sizeof(confidence), deviceType, sizeof(deviceType));
-
-    char ssid[33];
-    ssid[0] = '\0';
-    bool nameHit = false;
-
-    int ieOffset = (stype == 4) ? 24 : 36;
-    if (ieOffset < len) {
-        const uint8_t *ie  = d + ieOffset;
-        int            rem = len - ieOffset;
-
-        while (rem >= 2) {
-            uint8_t id   = ie[0];
-            uint8_t elen = ie[1];
-            if (elen + 2 > rem) break;
-
-            if (id == 0 && elen > 0) {
-                int n = elen > 32 ? 32 : elen;
-                memcpy(ssid, ie + 2, n);
-                ssid[n] = '\0';
-                if (containsFlockKeyword(ssid)) {
-                    nameHit = true;
-                    classifyFlockNameHit(ssid, method, sizeof(method), confidence, sizeof(confidence), deviceType, sizeof(deviceType));
-                    break;
-                }
-            }
-            ie  += elen + 2;
-            rem -= elen + 2;
-        }
-    }
-
-    if (!nameHit && !macHit) return;
-    if (!ssid[0]) snprintf(ssid, sizeof(ssid), "<hidden/none>");
-
-    strncpy(flockPendingSSID, ssid, sizeof(flockPendingSSID) - 1);
-    flockPendingSSID[sizeof(flockPendingSSID) - 1] = '\0';
-    strncpy(flockPendingSrc, src, sizeof(flockPendingSrc) - 1);
-    flockPendingSrc[sizeof(flockPendingSrc) - 1] = '\0';
-    strncpy(flockPendingMethod, method, sizeof(flockPendingMethod) - 1);
-    flockPendingMethod[sizeof(flockPendingMethod) - 1] = '\0';
-    strncpy(flockPendingConfidence, confidence, sizeof(flockPendingConfidence) - 1);
-    flockPendingConfidence[sizeof(flockPendingConfidence) - 1] = '\0';
-    strncpy(flockPendingDeviceType, deviceType, sizeof(flockPendingDeviceType) - 1);
-    flockPendingDeviceType[sizeof(flockPendingDeviceType) - 1] = '\0';
-    flockPendingType  = (stype == 4) ? 1 : 0;
-    flockPendingRSSI  = pkt->rx_ctrl.rssi;
-    flockPendingReady = true;
+static void flock_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (flockActive) enqueueFlockWifiFrame(buf, type, flockQueue);
 }
 
 static void flock_refresh_cb(lv_timer_t *) {
     if (!flockStatusLbl || !flockList) return;
-
-    // Process any pending hit from the ISR
-    if (flockPendingReady) {
-        char ssid[33], src[18], method[18], confidence[8], deviceType[20];
-        uint8_t ft   = flockPendingType;
-        int8_t  rssi = flockPendingRSSI;
-        memcpy(ssid, flockPendingSSID, 33);
-        memcpy(src,  flockPendingSrc,  18);
-        memcpy(method, flockPendingMethod, 18);
-        memcpy(confidence, flockPendingConfidence, 8);
-        memcpy(deviceType, flockPendingDeviceType, 20);
-        flockPendingReady = false;
-        const bool shouldAlert = scanShouldAlert(src);
-
-        // Deduplicate hits. MAC-based dedupe prevents repeated frames from
-        // the same device from inflating the count, while still allowing
-        // multiple devices that share the same SSID to be listed separately.
-        bool found = false;
-        for (int i = 0; i < flockHitCount; i++) {
-#if FLOCK_DEDUPE_BY_MAC
-            bool sameHit = (strcmp(flockHits[i].src, src) == 0);
-#else
-            bool sameHit = (strcmp(flockHits[i].ssid, ssid) == 0);
-#endif
-            if (sameHit) {
-                strncpy(flockHits[i].ssid, ssid, 32);
-                flockHits[i].ssid[32] = '\0';
-                strncpy(flockHits[i].method, method, sizeof(flockHits[i].method) - 1);
-                strncpy(flockHits[i].confidence, confidence, sizeof(flockHits[i].confidence) - 1);
-                strncpy(flockHits[i].type, deviceType, sizeof(flockHits[i].type) - 1);
-                flockHits[i].frameType = ft;
-                flockHits[i].rssi = rssi;   // update RSSI
-                flockHits[i].count++;
-                flockHits[i].lastSeen = millis();
-                if (shouldAlert) playFlockChirp();
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            int slot = flockHitCount;
-            if (flockHitCount >= MAX_FLOCK_HITS) {
+    rogue_radar::FlockObservation hit;
+    for (unsigned batch = 0; batch < 16 && popFlockQueue(flockQueue, hit); ++batch) {
+        int slot = -1;
+        for (int i = 0; i < flockHitCount; ++i)
+            if (!strcmp(flockHits[i].src, hit.mac)) { slot = i; break; }
+        if (slot < 0) {
+            if (flockHitCount < MAX_FLOCK_HITS) slot = flockHitCount++;
+            else {
                 slot = 0;
                 for (int i = 1; i < flockHitCount; ++i)
-                    if (flockHits[i].lastSeen < flockHits[slot].lastSeen) slot = i;
-            } else ++flockHitCount;
+                    if (uint32_t(millis() - flockHits[i].lastSeen) >
+                        uint32_t(millis() - flockHits[slot].lastSeen)) slot = i;
+            }
             memset(&flockHits[slot], 0, sizeof(flockHits[slot]));
-            strncpy(flockHits[slot].ssid, ssid, 32);
-            strncpy(flockHits[slot].src, src, 17);
-            strncpy(flockHits[slot].method, method, sizeof(flockHits[slot].method) - 1);
-            strncpy(flockHits[slot].confidence, confidence, sizeof(flockHits[slot].confidence) - 1);
-            strncpy(flockHits[slot].type, deviceType, sizeof(flockHits[slot].type) - 1);
-            flockHits[slot].frameType = ft;
-            flockHits[slot].rssi = rssi; flockHits[slot].count = 1;
-            flockHits[slot].firstSeen = flockHits[slot].lastSeen = millis();
-            if (shouldAlert) playFlockChirp();
+            snprintf(flockHits[slot].src, sizeof(flockHits[slot].src), "%s", hit.mac);
+            flockHits[slot].firstSeen = hit.seenMs;
+            flockHits[slot].receiverOnly = hit.receiverOnly;
+        }
+        auto &h = flockHits[slot];
+        // Receiver evidence never replaces a directly observed target's RSSI.
+        if (!hit.receiverOnly || h.receiverOnly) {
+            h.receiverOnly = hit.receiverOnly;
+            h.rssi = hit.rssi;
+            h.frameType = hit.frame;
+            if (FlockQueue::rank(hit.confidence) >= FlockQueue::rank(h.confidence)) {
+                snprintf(h.ssid, sizeof(h.ssid), "%s", hit.name);
+                snprintf(h.method, sizeof(h.method), "%s", hit.method);
+                snprintf(h.confidence, sizeof(h.confidence), "%s", hit.confidence);
+                snprintf(h.type, sizeof(h.type), "%s", hit.type);
+            }
+        }
+        h.count = UINT32_MAX - h.count < hit.count ? UINT32_MAX : h.count + hit.count;
+        if (!hit.receiverOnly || h.receiverOnly) {
+            h.lastSeen = hit.seenMs;
+            if (FlockQueue::rank(h.confidence) >= 2 && scanShouldAlert(h.src)) playFlockChirp();
         }
     }
-
-    // Update status label
-    if (flockHitCount == 0) {
-        lv_label_set_text(flockStatusLbl,
-            LV_SYMBOL_EYE_OPEN "  Watching... no Flock seen");
-        lv_obj_set_style_text_color(flockStatusLbl,
-            lv_color_hex(TH.textDim), LV_PART_MAIN);
-    } else {
-        char buf[56];
-        snprintf(buf, sizeof(buf),
-                 LV_SYMBOL_WARNING "  %d Flock hit%s detected!",
-                 flockHitCount, flockHitCount == 1 ? "" : "s");
-        lv_label_set_text(flockStatusLbl, buf);
-        lv_obj_set_style_text_color(flockStatusLbl,
-            lv_color_hex(TH.alert), LV_PART_MAIN);
+    const uint32_t now = millis();
+    if (now - flockLastPaint < 500) return;
+    flockLastPaint = now;
+    char status[64];
+    snprintf(status, sizeof(status), "%d possible match%s", flockHitCount, flockHitCount == 1 ? "" : "es");
+    if (!scanSessionAttached()) flockSetLabel(flockStatusLbl, status);
+    if (!flockHitCount) return;
+    if (!flockRowCount) lv_obj_clean(flockList); // retire the empty placeholder once
+    while (flockRowCount < flockHitCount) {
+        auto *label = lv_list_add_text(flockList, "");
+        lv_obj_set_style_text_color(label, lv_color_hex(TH.alert), LV_PART_MAIN);
+        flockRows[flockRowCount++] = label;
     }
-
-    // Rebuild list
-    lv_obj_clean(flockList);
-    if (flockHitCount == 0) {
-        lv_obj_t *e = lv_list_add_text(flockList,
-            "No matching beacons or probes yet.");
-        if (e) lv_obj_set_style_text_color(e,
-                    lv_color_hex(TH.textDim), LV_PART_MAIN);
-        return;
-    }
-    for (int i = 0; i < flockHitCount; i++) {
-        uint32_t age = (millis() - flockHits[i].lastSeen) / 1000UL;
-        char row[150];
-#if FLOCK_SHOW_SOURCE_MAC
-        snprintf(row, sizeof(row), "%s %s [%s] %ddBm x%u\n%s  %s  %lus",
-                 flockHits[i].frameType ? "PROBE" : "BEACON",
-                 flockHits[i].type[0] ? flockHits[i].type : "Flock",
-                 flockHits[i].confidence[0] ? flockHits[i].confidence : "High",
-                 flockHits[i].rssi,
-                 flockHits[i].count,
-                 flockHits[i].src,
-                 flockHits[i].method[0] ? flockHits[i].method : "Name",
-                 (unsigned long)age);
-#else
-        snprintf(row, sizeof(row), "%s %s [%s] %ddBm x%u",
-                 flockHits[i].frameType ? "PROBE" : "BEACON",
-                 flockHits[i].type[0] ? flockHits[i].type : "Flock",
-                 flockHits[i].confidence[0] ? flockHits[i].confidence : "High",
-                 flockHits[i].rssi,
-                 flockHits[i].count);
-#endif
-        lv_obj_t *entry = lv_list_add_text(flockList, row);
-        if (entry)
-            lv_obj_set_style_text_color(entry,
-                lv_color_hex(TH.alert), LV_PART_MAIN);
+    for (int i = 0; i < flockHitCount; ++i) {
+        auto &h = flockHits[i];
+        char signal[24], row[170];
+        if (h.receiverOnly) snprintf(signal, sizeof(signal), "receiver hint");
+        else snprintf(signal, sizeof(signal), "%d dBm", h.rssi);
+        snprintf(row, sizeof(row), "%s [%s] %s x%lu\n%s  %s  %lus",
+                 h.type, h.confidence, signal, (unsigned long)h.count,
+                 h.src, h.method, (unsigned long)((now - h.lastSeen) / 1000));
+        flockSetLabel(flockRows[i], row);
     }
 }
 
 static bool flockScanStart() {
     if (!scanSessionIsResume()) {
-        flockHitCount = 0; flockPendingReady = false;
+        flockHitCount = 0; resetFlockQueue(flockQueue);
+        flockRowCount = 0; memset(flockRows, 0, sizeof(flockRows));
+        lv_obj_clean(flockList);
+        lv_list_add_text(flockList, "No matching signals yet.");
         memset(flockHits, 0, sizeof(flockHits));
     }
     WiFi.mode(WIFI_STA); WiFi.disconnect();
     esp_wifi_set_promiscuous(false); esp_wifi_set_promiscuous_rx_cb(nullptr);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    wifi_promiscuous_filter_t filter{WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA};
+    esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_promiscuous_rx_cb(flock_sniffer_cb);
     esp_wifi_set_promiscuous(true);
     deauthChannel = 1; flockActive = true;
@@ -12738,14 +12681,13 @@ static bool flockScanStart() {
 static bool flockScanStop() {
     flockActive = false;
     esp_wifi_set_promiscuous(false); esp_wifi_set_promiscuous_rx_cb(nullptr);
+    resetFlockQueue(flockQueue);
     stopLEDSpinner(MENU_COLORS[0].r, MENU_COLORS[0].g, MENU_COLORS[0].b);
     return true;
 }
 
 static void flockScanPoll() {
-    static uint32_t lastMs = 0;
-    if (millis() - lastMs < 250) return;
-    lastMs = millis(); flock_refresh_cb(nullptr);
+    flock_refresh_cb(nullptr); // bounded draining every loop; painting is throttled
 }
 
 static int flockScanCount() { return flockHitCount; }
@@ -12753,7 +12695,9 @@ static int flockScanCount() { return flockHitCount; }
 void createFlockDetector() {
     // Reset state
     flockHitCount     = 0;
-    flockPendingReady = false;
+    resetFlockQueue(flockQueue);
+    flockRowCount = 0; flockLastPaint = 0;
+    memset(flockRows, 0, sizeof(flockRows));
     flockStatusLbl    = nullptr;
     flockList         = nullptr;
     memset(flockHits, 0, sizeof(flockHits));
@@ -12765,8 +12709,8 @@ void createFlockDetector() {
 
     flockStatusLbl = lv_label_create(wifiToolScreen);
     lv_label_set_text(flockStatusLbl,
-        "Sniffs beacons & probes for Flock patterns\n"
-        "Flock-XXXX / FS_ / FS- / FlockOS / FlockCam");
+        "Passive WiFi frame monitoring\n"
+        "Matches are evidence, not confirmed identity");
     lv_obj_set_style_text_color(flockStatusLbl,
         lv_color_hex(TH.textDim), LV_PART_MAIN);
     lv_obj_set_pos(flockStatusLbl, 8, 30);
@@ -12781,7 +12725,7 @@ void createFlockDetector() {
     lv_obj_set_style_pad_row(flockList,      1, LV_PART_MAIN);
 
     lv_obj_t *initLbl =
-        lv_list_add_text(flockList, "No matching beacons or probes yet.");
+        lv_list_add_text(flockList, "No matching signals yet.");
     if (initLbl)
         lv_obj_set_style_text_color(initLbl,
             lv_color_hex(TH.textDim), LV_PART_MAIN);
@@ -12826,349 +12770,156 @@ static int hybridFocusedIndex() {
 
 static void hybridUpsertHit(const char *source, const char *name, const char *mac,
                             int8_t rssi, const char *reason,
-                            const char *method = "Name",
-                            const char *confidence = "High",
-                            const char *type = "Flock") {
+                            const char *method = "Name", const char *confidence = "Hint",
+                            const char *type = "Flock candidate", bool receiverOnly = false,
+                            uint16_t observations = 1, uint8_t addressType = 255) {
     if (!source || !name || !mac || !reason) return;
-    char alertKey[28];
-    snprintf(alertKey, sizeof(alertKey), "%s:%s", source, mac);
-    const bool shouldAlert = scanShouldAlert(alertKey);
-
-    for (int i = 0; i < hybridHitCount; i++) {
-        if (strcmp(hybridHits[i].source, source) == 0 &&
-            strcmp(hybridHits[i].mac, mac) == 0) {
-            strncpy(hybridHits[i].name, name, sizeof(hybridHits[i].name) - 1);
-            hybridHits[i].name[sizeof(hybridHits[i].name) - 1] = '\0';
-            strncpy(hybridHits[i].reason, reason, sizeof(hybridHits[i].reason) - 1);
-            hybridHits[i].reason[sizeof(hybridHits[i].reason) - 1] = '\0';
-            strncpy(hybridHits[i].method, method, sizeof(hybridHits[i].method) - 1);
-            hybridHits[i].method[sizeof(hybridHits[i].method) - 1] = '\0';
-            strncpy(hybridHits[i].confidence, confidence, sizeof(hybridHits[i].confidence) - 1);
-            hybridHits[i].confidence[sizeof(hybridHits[i].confidence) - 1] = '\0';
-            strncpy(hybridHits[i].type, type, sizeof(hybridHits[i].type) - 1);
-            hybridHits[i].type[sizeof(hybridHits[i].type) - 1] = '\0';
-            hybridHits[i].rssi = rssi;
-            hybridHits[i].count++;
-            hybridHits[i].lastSeen = millis();
-            if (shouldAlert) playFlockChirp();
-            return;
-        }
-    }
-
-    int slot = hybridHitCount;
-    if (hybridHitCount >= MAX_FLOCK_HYBRID_HITS) {
-        const int focused = hybridFocusedIndex();
-        slot = -1;
-        for (int i = 0; i < hybridHitCount; ++i) {
-            if (i == focused) continue;
-            if (slot < 0 || hybridHits[i].lastSeen < hybridHits[slot].lastSeen) slot = i;
-        }
-        if (slot < 0) return;
-    } else ++hybridHitCount;
-    FlockHybridHit &h = hybridHits[slot];
-    memset(&h, 0, sizeof(h));
-    strncpy(h.source, source, sizeof(h.source) - 1);
-    strncpy(h.name, name, sizeof(h.name) - 1);
-    strncpy(h.mac, mac, sizeof(h.mac) - 1);
-    strncpy(h.reason, reason, sizeof(h.reason) - 1);
-    strncpy(h.method, method, sizeof(h.method) - 1);
-    strncpy(h.confidence, confidence, sizeof(h.confidence) - 1);
-    strncpy(h.type, type, sizeof(h.type) - 1);
-    h.rssi = rssi;
-    h.count = 1;
-    h.firstSeen = millis();
-    h.lastSeen = millis();
-    if (shouldAlert) playFlockChirp();
-}
-
-static void hybridSortByRSSI() {
-    for (int i = 0; i < hybridHitCount - 1; i++) {
-        for (int j = 0; j < hybridHitCount - 1 - i; j++) {
-            if (hybridHits[j].rssi < hybridHits[j + 1].rssi) {
-                FlockHybridHit tmp = hybridHits[j];
-                hybridHits[j] = hybridHits[j + 1];
-                hybridHits[j + 1] = tmp;
+    int slot = -1;
+    for (int i = 0; i < hybridHitCount; ++i)
+        if (!strcmp(hybridHits[i].source, source) && !strcmp(hybridHits[i].mac, mac) &&
+            hybridHits[i].addressType == addressType) { slot = i; break; }
+    if (slot < 0) {
+        if (hybridHitCount < MAX_FLOCK_HYBRID_HITS) slot = hybridHitCount++;
+        else {
+            const int focused = hybridFocusedIndex();
+            for (int i = 0; i < hybridHitCount; ++i) {
+                if (i == focused) continue;
+                if (slot < 0 || uint32_t(millis() - hybridHits[i].lastSeen) >
+                    uint32_t(millis() - hybridHits[slot].lastSeen)) slot = i;
             }
         }
+        if (slot < 0) return;
+        memset(&hybridHits[slot], 0, sizeof(hybridHits[slot]));
+        snprintf(hybridHits[slot].source, sizeof(hybridHits[slot].source), "%s", source);
+        snprintf(hybridHits[slot].mac, sizeof(hybridHits[slot].mac), "%s", mac);
+        hybridHits[slot].addressType = addressType;
+        hybridHits[slot].firstSeen = millis();
+        hybridHits[slot].receiverOnly = receiverOnly;
+    }
+    auto &h = hybridHits[slot];
+    if (!receiverOnly || h.receiverOnly) {
+        h.receiverOnly = receiverOnly;
+        h.rssi = rssi;
+        if (FlockQueue::rank(confidence) >= FlockQueue::rank(h.confidence)) {
+            snprintf(h.name, sizeof(h.name), "%s", name);
+            snprintf(h.reason, sizeof(h.reason), "%s", reason);
+            snprintf(h.method, sizeof(h.method), "%s", method);
+            snprintf(h.confidence, sizeof(h.confidence), "%s", confidence);
+            snprintf(h.type, sizeof(h.type), "%s", type);
+        }
+    }
+    h.count = UINT32_MAX - h.count < observations ? UINT32_MAX : h.count + observations;
+    if (!receiverOnly || h.receiverOnly) {
+        h.lastSeen = millis();
+        char key[32]; snprintf(key, sizeof(key), "%s:%s:%u", source, mac, addressType);
+        if (FlockQueue::rank(h.confidence) >= 2 && scanShouldAlert(key)) playFlockChirp();
     }
 }
 
 static void hybridProcessPendingWifi() {
-    if (!hybridPendingReady) return;
-    char name[33], mac[18], reason[24], method[24], confidence[8], type[20];
-    int8_t rssi = hybridPendingRSSI;
-    memcpy(name, hybridPendingName, sizeof(name));
-    memcpy(mac, hybridPendingMac, sizeof(mac));
-    memcpy(reason, hybridPendingReason, sizeof(reason));
-    memcpy(method, hybridPendingMethod, sizeof(method));
-    memcpy(confidence, hybridPendingConfidence, sizeof(confidence));
-    memcpy(type, hybridPendingType, sizeof(type));
-    hybridPendingReady = false;
-    hybridUpsertHit("WiFi", name, mac, rssi, reason, method, confidence, type);
+    rogue_radar::FlockObservation hit;
+    for (unsigned batch = 0; batch < 16 && popFlockQueue(hybridWifiQueue, hit); ++batch)
+        hybridUpsertHit("WiFi", hit.name, hit.mac, hit.rssi,
+                       hit.receiverOnly ? "Receiver-only evidence" : "Transmitter evidence",
+                       hit.method, hit.confidence, hit.type, hit.receiverOnly, hit.count);
 }
 
 static void hybridRebuildList() {
-    if (!hybridList) return;
-    hybridSortByRSSI();
-
-    // Rebuild group so results are selectable without losing Back/Start Scan.
-    deleteGroup(&wifiToolGroup);
-    wifiToolGroup = lv_group_create();
-    if (hybridBackBtn) lv_group_add_obj(wifiToolGroup, hybridBackBtn);
-    if (hybridScanBtn) lv_group_add_obj(wifiToolGroup, hybridScanBtn);
-
-    lv_obj_clean(hybridList);
-
-    if (hybridHitCount == 0) {
-        lv_obj_t *e = lv_list_add_text(hybridList,
-            "No combined Flock hits yet. Press Start Scan.");
-        if (e) lv_obj_set_style_text_color(e, lv_color_hex(TH.textDim), LV_PART_MAIN);
-        scanRestoreControls();
-        setGroup(wifiToolGroup);
-        return;
+    if (!hybridList || !wifiToolGroup) return;
+    if (hybridRowsReset) {
+        lv_obj_clean(hybridList);
+        memset(hybridRows, 0, sizeof(hybridRows));
+        hybridRowCount = 0; hybridRowsReset = false; hybridLastPaint = 0;
+        if (!hybridHitCount) lv_list_add_text(hybridList, "No combined matches yet. Press Start.");
     }
-
-    for (int i = 0; i < hybridHitCount; i++) {
-        uint32_t age = (millis() - hybridHits[i].lastSeen) / 1000UL;
-        char row[156];
-#if FLOCK_HYBRID_SHOW_MAC
-        snprintf(row, sizeof(row), "%s %s [%s] %ddBm x%u\n%s  %s  %lus",
-                 hybridHits[i].source,
-                 hybridHits[i].type[0] ? hybridHits[i].type : "Flock",
-                 hybridHits[i].confidence[0] ? hybridHits[i].confidence : "High",
-                 hybridHits[i].rssi,
-                 hybridHits[i].count,
-                 hybridHits[i].mac,
-                 hybridHits[i].method[0] ? hybridHits[i].method : hybridHits[i].reason,
-                 (unsigned long)age);
-#else
-        snprintf(row, sizeof(row), "%s %s [%s] %ddBm x%u",
-                 hybridHits[i].source,
-                 hybridHits[i].type[0] ? hybridHits[i].type : "Flock",
-                 hybridHits[i].confidence[0] ? hybridHits[i].confidence : "High",
-                 hybridHits[i].rssi,
-                 hybridHits[i].count);
-#endif
-        lv_obj_t *btn = lv_list_add_btn(hybridList, nullptr, row);
-        if (btn) {
-            styleListBtn(btn);
-            lv_obj_set_style_text_color(btn,
-                strcmp(hybridHits[i].source, "BLE") == 0 ? lv_color_hex(TH.accent) : lv_color_hex(TH.alert),
-                LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
-                scanRequestNavigation(createFlockHybridDetail,
-                                      (int)(intptr_t)lv_event_get_user_data(ev));
-            }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-            lv_group_add_obj(wifiToolGroup, btn);
-        }
+    const uint32_t now = millis();
+    if (hybridRowCount == hybridHitCount && now - hybridLastPaint < 500) return;
+    hybridLastPaint = now;
+    if (!hybridHitCount) return;
+    if (!hybridRowCount) lv_obj_clean(hybridList);
+    // Rows keep stable indices and focus; no re-sorting or group rebuilding on hits.
+    while (hybridRowCount < hybridHitCount) {
+        const unsigned index = hybridRowCount++;
+        auto *btn = lv_list_add_btn(hybridList, nullptr, "");
+        styleListBtn(btn);
+        lv_obj_add_event_cb(btn, [](lv_event_t *ev) {
+            scanRequestNavigation(createFlockHybridDetail, (int)(intptr_t)lv_event_get_user_data(ev));
+        }, LV_EVENT_CLICKED, (void *)(intptr_t)index);
+        hybridRows[index] = btn;
+        lv_group_add_obj(wifiToolGroup, btn);
+    }
+    for (int i = 0; i < hybridHitCount; ++i) {
+        const auto &h = hybridHits[i];
+        char signal[24], row[180];
+        if (h.receiverOnly) snprintf(signal, sizeof(signal), "receiver hint");
+        else snprintf(signal, sizeof(signal), "%d dBm", h.rssi);
+        snprintf(row, sizeof(row), "%s %s [%s] %s x%lu\n%s  %s  %lus",
+                 h.source, h.type, h.confidence, signal, (unsigned long)h.count,
+                 h.mac, h.method, (unsigned long)((now - h.lastSeen) / 1000));
+        const char *label = lv_list_get_btn_text(hybridList, hybridRows[i]);
+        if (!label || strcmp(label, row)) setListBtnText(hybridRows[i], row);
     }
     scanRestoreControls();
-    setGroup(wifiToolGroup);
 }
 
-static const char *hybridKeywordReason(const char *name) {
-    if (flockHasStrictIdPattern(name)) return "Flock-ID";
-    if (flockContainsKeyword(name, FLOCK_KEYWORD_1)) return FLOCK_KEYWORD_1;
-    if (flockContainsKeyword(name, FLOCK_KEYWORD_2)) return FLOCK_KEYWORD_2;
-    if (flockContainsKeyword(name, FLOCK_KEYWORD_3)) return FLOCK_KEYWORD_3;
-    if (flockContainsKeyword(name, FLOCK_KEYWORD_4)) return "fs battery";
-    if (flockContainsKeyword(name, FLOCK_KEYWORD_5)) return FLOCK_KEYWORD_5;
-    if (flockContainsKeyword(name, FLOCK_KEYWORD_6)) return FLOCK_KEYWORD_6;
-    if (flockContainsKeyword(name, FLOCK_KEYWORD_7)) return "flocksafety";
-    if (flockContainsKeyword(name, FLOCK_KEYWORD_8)) return FLOCK_KEYWORD_8;
-    if (flockContainsKeyword(name, FLOCK_KEYWORD_9)) return FLOCK_KEYWORD_9;
-    return "keyword";
-}
-
-static bool hybridNameIsTenDigits(const char *name) {
-    if (!name) return false;
-    int len = 0;
-    for (; name[len]; len++) {
-        if (name[len] < '0' || name[len] > '9') return false;
-    }
-    return len == 10;
-}
-
-static bool detectFlockBLE(BLEAdvertisedDevice &dev, char *reason, size_t reasonLen,
-                            char *method, size_t methodLen,
-                            char *confidence, size_t confidenceLen,
+static bool detectFlockBLE(BLEAdvertisedDevice &dev,
+                            char *method, size_t methodLen, char *confidence, size_t confidenceLen,
                             char *type, size_t typeLen) {
-    if (reason && reasonLen) reason[0] = '\0';
-    if (method && methodLen) method[0] = '\0';
-    if (confidence && confidenceLen) confidence[0] = '\0';
-    if (type && typeLen) type[0] = '\0';
-
-    String macStr = dev.getAddress().toString().c_str();
-    if (classifyFlockMac(macStr.c_str(), method, methodLen, confidence, confidenceLen, type, typeLen)) {
-        snprintf(reason, reasonLen, "%s", method);
-        return true;
+    const auto name = dev.getName();
+    const auto manufacturer = dev.getManufacturerData();
+    auto address = dev.getAddress();
+    // This decoder is called only on the serialized BTC advertisement task.
+    // Keep its bounded workspace off that small stack; the main loop never
+    // touches it and only receives copied queue entries.
+    static char uuidText[16][37];
+    static const char *uuids[16];
+    const unsigned uuidCount = min(unsigned(dev.getServiceUUIDCount()), 16U);
+    for (unsigned i = 0; i < uuidCount; ++i) {
+        const auto uuid = dev.getServiceUUID(i).toString();
+        snprintf(uuidText[i], sizeof(uuidText[i]), "%s", uuid.c_str());
+        uuids[i] = uuidText[i];
     }
-
-    if (dev.haveName()) {
-        String nm = String(dev.getName().c_str());
-        char nbuf[33];
-        strncpy(nbuf, nm.c_str(), sizeof(nbuf) - 1);
-        nbuf[sizeof(nbuf) - 1] = '\0';
-
-        if (containsFlockKeyword(nbuf)) {
-            snprintf(reason, reasonLen, "Name:%s", hybridKeywordReason(nbuf));
-            if (flockHasStrictIdPattern(nbuf)) {
-                snprintf(method, methodLen, "Flock-ID");
-            } else {
-                snprintf(method, methodLen, "Name");
-            }
-            snprintf(confidence, confidenceLen, "High");
-            snprintf(type, typeLen, "Flock");
-            return true;
-        }
-        if (hybridNameIsTenDigits(nbuf)) {
-            snprintf(reason, reasonLen, "10-digit name");
-            snprintf(method, methodLen, "Name Pattern");
-            snprintf(confidence, confidenceLen, "Medium");
-            snprintf(type, typeLen, "Flock?");
-            return true;
-        }
-    }
-
-#if FLOCK_BLE_MFR_ID_MATCH_ENABLED
-    if (dev.haveManufacturerData()) {
-        std::string md = dev.getManufacturerData();
-        if (md.length() >= 2) {
-            uint16_t code = ((uint16_t)(uint8_t)md[1] << 8) | (uint16_t)(uint8_t)md[0];
-            if (code == FLOCK_BLE_MFR_ID_XUNTONG) {
-                snprintf(reason, reasonLen, "MFG 09C8");
-                snprintf(method, methodLen, "BLE MFR ID");
-                snprintf(confidence, confidenceLen, "High");
-                snprintf(type, typeLen, "Flock/XUNTONG");
-                return true;
-            }
-        }
-    }
-#endif
-
-    return false;
+    const rogue_radar::FlockBleObservation observation{
+        name.c_str(), *address.getNative(), uint8_t(dev.getAddressType()),
+        reinterpret_cast<const uint8_t *>(manufacturer.data()), manufacturer.size(), uuids, uuidCount};
+    rogue_radar::FlockBleClassification result{};
+    if (!rogue_radar::classifyFlockBle(observation, result)) return false;
+    snprintf(method, methodLen, "%s", rogue_radar::flockBleEvidenceLabel(result.evidence));
+    snprintf(confidence, confidenceLen, "%s", rogue_radar::flockWifiConfidenceLabel(result.confidence));
+    snprintf(type, typeLen, "%s", rogue_radar::flockBleDeviceTypeLabel(result.deviceType));
+    return true;
 }
 
 static void hybrid_wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
-    if (!hybridWifiActive || type != WIFI_PKT_MGMT || hybridPendingReady) return;
-
-    const wifi_promiscuous_pkt_t *pkt = reinterpret_cast<const wifi_promiscuous_pkt_t *>(buf);
-    const uint8_t *d = pkt->payload;
-    int len = pkt->rx_ctrl.sig_len;
-    if (len < 24) return;
-
-    uint8_t fc0 = d[0];
-    uint8_t ftype = (fc0 >> 2) & 0x03;
-    uint8_t stype = (fc0 >> 4) & 0x0F;
-    if (ftype != 0) return;
-    if (stype != 8 && stype != 5 && stype != 4) return;
-
-    char mac[18];
-    snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-             d[10], d[11], d[12], d[13], d[14], d[15]);
-
-    char reason[24] = "";
-    char method[24] = "";
-    char confidence[8] = "";
-    char deviceType[20] = "";
-    bool macHit = classifyFlockMac(mac, method, sizeof(method), confidence, sizeof(confidence), deviceType, sizeof(deviceType));
-
-    char ssid[33];
-    ssid[0] = '\0';
-    bool nameHit = false;
-
-    int ieOffset = (stype == 4) ? 24 : 36;
-    if (ieOffset < len) {
-        const uint8_t *ie = d + ieOffset;
-        int rem = len - ieOffset;
-        while (rem >= 2) {
-            uint8_t id = ie[0];
-            uint8_t elen = ie[1];
-            if (elen + 2 > rem) break;
-
-            if (id == 0 && elen > 0) {
-                int n = elen > 32 ? 32 : elen;
-                memcpy(ssid, ie + 2, n);
-                ssid[n] = '\0';
-
-                if (containsFlockKeyword(ssid)) {
-                    nameHit = true;
-                    snprintf(reason, sizeof(reason), "%s:%s",
-                             (stype == 4) ? "Probe" : "Beacon",
-                             hybridKeywordReason(ssid));
-                    if (flockHasStrictIdPattern(ssid)) {
-                        snprintf(method, sizeof(method), "Flock-ID");
-                    } else {
-                        snprintf(method, sizeof(method), "Name");
-                    }
-                    snprintf(confidence, sizeof(confidence), "High");
-                    snprintf(deviceType, sizeof(deviceType), "Flock");
-                    break;
-                }
-            }
-            ie += elen + 2;
-            rem -= elen + 2;
-        }
-    }
-
-    if (!nameHit && !macHit) return;
-    if (!reason[0]) snprintf(reason, sizeof(reason), "%s", (stype == 4) ? "Probe MAC" : "Beacon MAC");
-    if (!ssid[0]) snprintf(ssid, sizeof(ssid), "<hidden/none>");
-
-    strncpy(hybridPendingName, ssid, sizeof(hybridPendingName) - 1);
-    hybridPendingName[sizeof(hybridPendingName) - 1] = '\0';
-    strncpy(hybridPendingMac, mac, sizeof(hybridPendingMac) - 1);
-    hybridPendingMac[sizeof(hybridPendingMac) - 1] = '\0';
-    strncpy(hybridPendingReason, reason, sizeof(hybridPendingReason) - 1);
-    hybridPendingReason[sizeof(hybridPendingReason) - 1] = '\0';
-    strncpy(hybridPendingMethod, method, sizeof(hybridPendingMethod) - 1);
-    hybridPendingMethod[sizeof(hybridPendingMethod) - 1] = '\0';
-    strncpy(hybridPendingConfidence, confidence, sizeof(hybridPendingConfidence) - 1);
-    hybridPendingConfidence[sizeof(hybridPendingConfidence) - 1] = '\0';
-    strncpy(hybridPendingType, deviceType, sizeof(hybridPendingType) - 1);
-    hybridPendingType[sizeof(hybridPendingType) - 1] = '\0';
-    hybridPendingRSSI = pkt->rx_ctrl.rssi;
-    hybridPendingReady = true;
+    if (hybridWifiActive) enqueueFlockWifiFrame(buf, type, hybridWifiQueue);
 }
 
+static volatile uint32_t hybridCallbackStackMinimum = UINT32_MAX;
 static void hybridBleResult(BLEAdvertisedDevice &dev, void *) {
-    char reason[24], method[24], confidence[8], deviceType[20];
-    const bool match = detectFlockBLE(dev, reason, sizeof(reason), method, sizeof(method),
-                                      confidence, sizeof(confidence),
-                                      deviceType, sizeof(deviceType));
-    String name = match && dev.haveName() ? dev.getName().c_str() : "<unknown>";
-    String mac = match ? dev.getAddress().toString().c_str() : "";
-    HybridBleMailbox candidate{};
-    if (match) {
-        snprintf(candidate.name, sizeof(candidate.name), "%s", name.c_str());
-        snprintf(candidate.mac, sizeof(candidate.mac), "%s", mac.c_str());
-        snprintf(candidate.reason, sizeof(candidate.reason), "%s", reason);
-        snprintf(candidate.method, sizeof(candidate.method), "%s", method);
-        snprintf(candidate.confidence, sizeof(candidate.confidence), "%s", confidence);
-        snprintf(candidate.type, sizeof(candidate.type), "%s", deviceType);
-        candidate.rssi = (int8_t)dev.getRSSI();
-        candidate.ready = true;
-    }
+    // BTC callbacks are serialized; pushFlockQueue copies before returning.
+    static rogue_radar::FlockObservation hit;
+    const bool match = detectFlockBLE(dev, hit.method, sizeof(hit.method),
+                                      hit.confidence, sizeof(hit.confidence), hit.type, sizeof(hit.type));
     portENTER_CRITICAL(&hybridBleMux);
-    ++hybridBleHeardCount;
-    if (match && !hybridBleMailbox.ready) {
-        hybridBleMailbox = candidate;
-    }
+    if (hybridBleHeardCount < UINT32_MAX) ++hybridBleHeardCount;
     portEXIT_CRITICAL(&hybridBleMux);
+#if defined(ROGUE_RADAR_SCAN_SESSION_DEVICE_TEST) && ROGUE_RADAR_SCAN_SESSION_DEVICE_TEST
+    const uint32_t freeStack = uxTaskGetStackHighWaterMark(nullptr);
+    if (freeStack < hybridCallbackStackMinimum) hybridCallbackStackMinimum = freeStack;
+#endif
+    if (!match) return;
+    const auto name = dev.getName(); const auto mac = dev.getAddress().toString();
+    snprintf(hit.name, sizeof(hit.name), "%s", name.empty() ? "<unknown>" : name.c_str());
+    snprintf(hit.mac, sizeof(hit.mac), "%s", mac.c_str());
+    hit.addressType = uint8_t(dev.getAddressType());
+    hit.rssi = dev.getRSSI(); hit.seenMs = millis();
+    pushFlockQueue(hybridBleQueue, hit);
 }
-
 static void hybridConsumeBleMailbox() {
-    HybridBleMailbox hit{};
-    portENTER_CRITICAL(&hybridBleMux);
-    if (hybridBleMailbox.ready) {
-        hit = hybridBleMailbox;
-        hybridBleMailbox.ready = false;
-    }
-    portEXIT_CRITICAL(&hybridBleMux);
-    if (!hit.ready) return;
-    hybridUpsertHit("BLE", hit.name, hit.mac, hit.rssi, hit.reason,
-                    hit.method, hit.confidence, hit.type);
-    hybridRebuildList();
+    rogue_radar::FlockObservation hit;
+    for (unsigned batch = 0; batch < 8 && popFlockQueue(hybridBleQueue, hit); ++batch)
+        hybridUpsertHit("BLE", hit.name, hit.mac, hit.rssi, hit.method,
+                       hit.method, hit.confidence, hit.type, false, hit.count, hit.addressType);
 }
 
 static bool hybridBeginBlePhase() {
@@ -13179,13 +12930,15 @@ static bool hybridBeginBlePhase() {
 
 static bool hybridBeginWifiPhase() {
     WiFi.mode(WIFI_STA); WiFi.disconnect();
-    hybridPendingReady = false;
+    resetFlockQueue(hybridWifiQueue);
     hybridWifiActive = true;
     hybridWifiChannel = 1;
     hybridWifiPhaseStartedMs = hybridWifiLastHopMs = millis();
     deauthChannel = 1;
     esp_wifi_set_promiscuous(false); esp_wifi_set_promiscuous_rx_cb(nullptr);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    wifi_promiscuous_filter_t filter{WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA};
+    esp_wifi_set_promiscuous_filter(&filter);
     esp_wifi_set_promiscuous_rx_cb(hybrid_wifi_sniffer_cb);
     esp_wifi_set_promiscuous(true);
     hybridPhase = HybridScanPhase::Wifi;
@@ -13195,20 +12948,19 @@ static bool hybridBeginWifiPhase() {
 
 static bool hybridScanStart() {
     if (!scanSessionIsResume()) {
-        hybridHitCount = 0; hybridBleHeardCount = 0;
+        hybridHitCount = 0; hybridBleHeardCount = 0; hybridRowsReset = true;
         memset(hybridHits, 0, sizeof(hybridHits));
         hybridRebuildList();
     }
-    hybridPendingReady = false;
-    portENTER_CRITICAL(&hybridBleMux);
-    hybridBleMailbox.ready = false;
-    portEXIT_CRITICAL(&hybridBleMux);
+    resetFlockQueue(hybridWifiQueue);
+    resetFlockQueue(hybridBleQueue);
     return hybridBeginBlePhase();
 }
 
 static void hybridScanPoll() {
     hybridBleScan.poll();
     hybridConsumeBleMailbox();
+    hybridRebuildList();
     if (hybridPhase == HybridScanPhase::Ble) {
         if (hybridBleScan.completed()) {
             if (!hybridBeginWifiPhase()) scanSessionError("Hybrid WiFi phase failed");
@@ -13216,7 +12968,7 @@ static void hybridScanPoll() {
         return;
     }
     if (hybridPhase != HybridScanPhase::Wifi) return;
-    if (hybridPendingReady) { hybridProcessPendingWifi(); hybridRebuildList(); }
+    hybridProcessPendingWifi();
     const uint32_t now = millis();
     const uint16_t dwell = flockAdaptiveDwellMs(hybridWifiChannel, flockHybridHopMs);
     if (now - hybridWifiLastHopMs >= dwell) {
@@ -13242,104 +12994,14 @@ static bool hybridScanStop() {
     }
     hybridWifiActive = false;
     esp_wifi_set_promiscuous(false); esp_wifi_set_promiscuous_rx_cb(nullptr);
-    hybridPendingReady = false;
-    portENTER_CRITICAL(&hybridBleMux);
-    hybridBleMailbox.ready = false;
-    portEXIT_CRITICAL(&hybridBleMux);
+    resetFlockQueue(hybridWifiQueue);
+    resetFlockQueue(hybridBleQueue);
     hybridPhase = HybridScanPhase::Idle;
     stopLEDSpinner(FLOCK_HYBRID_LED_R, FLOCK_HYBRID_LED_G, FLOCK_HYBRID_LED_B);
     return true;
 }
 
 static int hybridScanCount() { return hybridHitCount; }
-
-static void runFlockHybridCycle() {
-    if (!hybridStatusLbl || !hybridList) return;
-
-    startLEDSpinner(FLOCK_HYBRID_LED_R, FLOCK_HYBRID_LED_G, FLOCK_HYBRID_LED_B, FLOCK_HYBRID_LED_SPIN_MS);
-
-    lv_label_set_text(hybridStatusLbl, LV_SYMBOL_BLUETOOTH "  BLE phase running...");
-    lv_obj_set_style_text_color(hybridStatusLbl, lv_color_hex(TH.accent), LV_PART_MAIN);
-    lv_timer_handler();
-
-    ensureBLEInit();
-    WiFi.disconnect();
-    delay(50);
-    BLEScan *pScan = BLEDevice::getScan();
-    pScan->setActiveScan(true);
-    pScan->setInterval(150);
-    pScan->setWindow(140);
-    BLEScanResults results = pScan->start(flockHybridBleSecs, false);
-    int total = results.getCount();
-    hybridBleHeardCount += (uint32_t)total;
-    for (int i = 0; i < total; i++) {
-        BLEAdvertisedDevice dev = results.getDevice(i);
-        char reason[24];
-        char method[24];
-        char confidence[8];
-        char deviceType[20];
-        if (detectFlockBLE(dev, reason, sizeof(reason),
-                           method, sizeof(method),
-                           confidence, sizeof(confidence),
-                           deviceType, sizeof(deviceType))) {
-            String nm = dev.haveName() ? dev.getName().c_str() : "<unknown>";
-            String mac = dev.getAddress().toString().c_str();
-            hybridUpsertHit("BLE", nm.c_str(), mac.c_str(), (int8_t)dev.getRSSI(), reason,
-                            method, confidence, deviceType);
-        }
-    }
-    pScan->clearResults();
-    hybridRebuildList();
-
-    lv_label_set_text(hybridStatusLbl, LV_SYMBOL_WIFI "  WiFi phase running...");
-    lv_obj_set_style_text_color(hybridStatusLbl, lv_color_hex(TH.warn), LV_PART_MAIN);
-    lv_timer_handler();
-
-    hybridPendingReady = false;
-    hybridWifiActive = true;
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_promiscuous_rx_cb(hybrid_wifi_sniffer_cb);
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-    uint8_t ch = 1;
-    deauthChannel = ch;
-    unsigned long startMs = millis();
-    unsigned long lastHopMs = 0;
-    unsigned long wifiMs = (unsigned long)flockHybridWifiSecs * 1000UL;
-
-    while ((millis() - startMs) < wifiMs && hybridWifiActive) {
-        if (hybridPendingReady) {
-            hybridProcessPendingWifi();
-            hybridRebuildList();
-        }
-        uint16_t hybridHopMs = flockAdaptiveDwellMs(ch, flockHybridHopMs);
-        if (millis() - lastHopMs >= (unsigned long)hybridHopMs) {
-            lastHopMs = millis();
-            ch = (ch % 13) + 1;
-            deauthChannel = ch;  // keep shared top-level hop state aligned
-            esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-        }
-        lv_timer_handler();
-        delay(15);
-    }
-
-    hybridWifiActive = false;
-    esp_wifi_set_promiscuous(false);
-    esp_wifi_set_promiscuous_rx_cb(nullptr);
-    hybridProcessPendingWifi();
-    hybridRebuildList();
-
-    char buf[64];
-    snprintf(buf, sizeof(buf), LV_SYMBOL_WARNING "  Hybrid complete — %d hit%s / %lu heard",
-             hybridHitCount, hybridHitCount == 1 ? "" : "s", (unsigned long)hybridBleHeardCount);
-    stopLEDSpinner(FLOCK_HYBRID_LED_R, FLOCK_HYBRID_LED_G, FLOCK_HYBRID_LED_B);
-
-    lv_label_set_text(hybridStatusLbl, buf);
-    lv_obj_set_style_text_color(hybridStatusLbl,
-        hybridHitCount ? lv_color_hex(TH.alert) : lv_color_hex(TH.textDim), LV_PART_MAIN);
-}
-
 
 void createFlockHybridDetail(int idx) {
     if (idx < 0 || idx >= hybridHitCount) return;
@@ -13369,6 +13031,9 @@ void createFlockHybridDetail(int idx) {
     lv_obj_set_scroll_dir(card, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
 
+    char signal[64];
+    if (h.receiverOnly) snprintf(signal, sizeof(signal), "Unavailable (receiver-only evidence)");
+    else snprintf(signal, sizeof(signal), "%d dBm (%s)", h.rssi, hybridSignalQuality(h.rssi));
     char info[760];
     snprintf(info, sizeof(info),
              "Source      : %s\n"
@@ -13378,13 +13043,13 @@ void createFlockHybridDetail(int idx) {
              "Reason      : %s\n"
              "Name / SSID : %s\n"
              "MAC         : %s\n"
-             "RSSI        : %d dBm (%s)\n"
-             "Seen Count  : %u\n"
+             "RSSI        : %s\n"
+             "Seen Count  : %lu\n"
              "Last Seen   : %lus ago\n"
              "First Seen  : %lus ago\n"
              "BLE Heard   : %lu advs\n\n"
-             "Note: Low confidence manufacturer-prefix hits can be false positives.\n"
-             "Raven UUID detection is intentionally left for a separate Raven Detector tool.",
+             "Hints can match unrelated hardware. Receiver-only evidence has no target RSSI.\n"
+             "Confidence describes the signature match, not verified identity.",
              h.source,
              h.type[0] ? h.type : "Flock",
              h.confidence[0] ? h.confidence : "High",
@@ -13392,8 +13057,8 @@ void createFlockHybridDetail(int idx) {
              h.reason,
              h.name,
              h.mac,
-             h.rssi, hybridSignalQuality(h.rssi),
-             h.count,
+             signal,
+             (unsigned long)h.count,
              (unsigned long)age,
              (unsigned long)firstAge,
              (unsigned long)hybridBleHeardCount);
@@ -13409,7 +13074,8 @@ void createFlockHybridDetail(int idx) {
     lv_obj_set_size(bar, SCREEN_W - 12, 5);
     lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -36);
     lv_bar_set_range(bar, -100, -30);
-    lv_bar_set_value(bar, h.rssi, LV_ANIM_ON);
+    lv_bar_set_value(bar, h.rssi, LV_ANIM_OFF);
+    if (h.receiverOnly) lv_obj_add_flag(bar, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_bg_color(bar, lv_color_hex(TH.barBg), LV_PART_MAIN);
     lv_obj_set_style_bg_color(bar, rssiColor(h.rssi), LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
@@ -13426,18 +13092,9 @@ void createFlockHybridDetail(int idx) {
     lv_screen_load_anim(wifiDetailScreen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 250, 0, false);
 }
 
-static void cb_runFlockHybrid(lv_event_t *e) {
-    runFlockHybridCycle();
-}
-
-static void cb_startFlockHybridTimer(lv_timer_t *t) {
-    if (hybridStartTimer) { lv_timer_delete(hybridStartTimer); hybridStartTimer = nullptr; }
-    runFlockHybridCycle();
-}
-
 void createFlockHybridScanner() {
-    hybridHitCount = 0;
-    hybridPendingReady = false;
+    hybridHitCount = 0; hybridRowsReset = true;
+    resetFlockQueue(hybridWifiQueue);
     hybridWifiActive = false;
     hybridStatusLbl = nullptr;
     hybridList = nullptr;
@@ -13468,9 +13125,14 @@ void createFlockHybridScanner() {
     lv_obj_set_style_pad_row(hybridList,      1, LV_PART_MAIN);
 
     hybridBackBtn = createBackBtn(wifiToolScreen, cb_wifiToolBack);
-    hybridScanBtn = createActionBtn(wifiToolScreen, LV_SYMBOL_REFRESH "  Start Scan", cb_runFlockHybrid);
+    hybridScanBtn = createActionBtn(wifiToolScreen, LV_SYMBOL_REFRESH "  Start Scan", [](lv_event_t *) {});
 
+    deleteGroup(&wifiToolGroup);
+    wifiToolGroup = lv_group_create();
+    lv_group_add_obj(wifiToolGroup, hybridBackBtn);
+    lv_group_add_obj(wifiToolGroup, hybridScanBtn);
     hybridRebuildList();
+    setGroup(wifiToolGroup);
 
     attachScanSession(wifiToolScreen, &wifiToolGroup, hybridBackBtn, hybridScanBtn,
                       hybridStatusLbl, "scanHybrid",
@@ -16345,6 +16007,9 @@ static void updateAutoReturnHome() {
 #if defined(ROGUE_RADAR_KNOWN_DEVICE_TEST) && ROGUE_RADAR_KNOWN_DEVICE_TEST
 #include "../tests/known_devices_device_test.h"
 #endif
+#if defined(ROGUE_RADAR_PERFORMANCE_TEST) && ROGUE_RADAR_PERFORMANCE_TEST
+#include "../tests/performance_device_test.h"
+#endif
 
 void setup() {
     boardEarlyInit();
@@ -16416,6 +16081,18 @@ void setup() {
     showSplashScreen();  // Splash Screen Call
 
     lv_init();
+#if defined(ROGUE_RADAR_BOARD_T_EMBED_CC1101)
+    // Full result lists plus focus/scroll layers exceed the default 64 KB pool.
+    // Keep internal RAM available for radios; this pool lives until reboot.
+    constexpr size_t displayPoolBytes = 128 * 1024;
+    void *displayPool = heap_caps_malloc(displayPoolBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (displayPool && lv_mem_add_pool(displayPool, displayPoolBytes)) {
+        Serial.println("[Display] Added 128 KB PSRAM drawing pool");
+    } else {
+        if (displayPool) heap_caps_free(displayPool);
+        Serial.println("[Display] Extra drawing pool unavailable; crowded lists may exhaust LVGL memory");
+    }
+#endif
 #if LV_USE_LOG
     // Surface allocation/assert diagnostics on the same USB log as the app.
     lv_log_register_print_cb([](lv_log_level_t, const char *message) {
@@ -16478,10 +16155,15 @@ void setup() {
 
     Serial.println("[Rogue-Radar] Boot complete.");
 #if defined(ROGUE_RADAR_SCAN_SESSION_DEVICE_TEST) && ROGUE_RADAR_SCAN_SESSION_DEVICE_TEST
+#if !defined(ROGUE_RADAR_PERFORMANCE_TEST) || !ROGUE_RADAR_PERFORMANCE_TEST
     scanSessionDeviceTestBegin();
+#endif
 #endif
 #if defined(ROGUE_RADAR_KNOWN_DEVICE_TEST) && ROGUE_RADAR_KNOWN_DEVICE_TEST
     known_device_test::begin();
+#endif
+#if defined(ROGUE_RADAR_PERFORMANCE_TEST) && ROGUE_RADAR_PERFORMANCE_TEST
+    performanceDeviceTestBegin();
 #endif
     Serial.println("====================================");
     Serial.println();
@@ -16490,7 +16172,36 @@ void setup() {
 // ════════════════════════════════════════════════════════════════
 //  LOOP
 // ════════════════════════════════════════════════════════════════
+// One bounded USB diagnostic line per minute, only when the host has space.
+// No device identities or SD writes; useful for comparing hours/days of uptime.
+static void reportRuntimeHealth(uint32_t loopStartedUs) {
+    static uint32_t lastReport = 0, count = 0, maximumUs = 0;
+    static uint64_t totalUs = 0;
+    const uint32_t elapsedUs = micros() - loopStartedUs;
+    ++count; totalUs += elapsedUs;
+    if (elapsedUs > maximumUs) maximumUs = elapsedUs;
+    const uint32_t now = millis();
+    if (now - lastReport < 60000) return;
+    lastReport = now;
+    if (Serial) {
+        lv_mem_monitor_t memory{};
+        lv_mem_monitor(&memory);
+        char line[240];
+        const int length = snprintf(line, sizeof(line),
+            "[Health] ms=%lu tool=%s loop_us=%lu/%lu heap=%u min=%u largest=%u lv=%lu/%lu\n",
+            (unsigned long)now, (scanSessionAttached() && scanSession.key[0]) ? scanSession.key : "other",
+            (unsigned long)(count ? totalUs / count : 0), (unsigned long)maximumUs,
+            ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+            (unsigned long)memory.free_size, (unsigned long)memory.free_biggest_size);
+        if (length > 0 && length < int(sizeof(line)) && Serial.availableForWrite() >= length)
+            Serial.write(reinterpret_cast<const uint8_t *>(line), length);
+    }
+    count = totalUs = maximumUs = 0;
+}
+
 void loop() {
+    const uint32_t loopStartedUs = micros();
     // Feed all available GPS bytes into TinyGPS++ — non-blocking
 #if RR_HAS_GPS
     while (gpsSerial.available())
@@ -16507,10 +16218,21 @@ void loop() {
     processNearbySignals();
     processKnownDevices();
 #if defined(ROGUE_RADAR_SCAN_SESSION_DEVICE_TEST) && ROGUE_RADAR_SCAN_SESSION_DEVICE_TEST
+#if defined(ROGUE_RADAR_PERFORMANCE_TEST) && ROGUE_RADAR_PERFORMANCE_TEST
+    if (performance_device_test::stage == performance_device_test::Stage::Done) {
+        static bool startedScanDiagnostics = false;
+        if (!startedScanDiagnostics) { scanSessionDeviceTestBegin(); startedScanDiagnostics = true; }
+        scanSessionDeviceTestProcess();
+    }
+#else
     scanSessionDeviceTestProcess();
+#endif
 #endif
 #if defined(ROGUE_RADAR_KNOWN_DEVICE_TEST) && ROGUE_RADAR_KNOWN_DEVICE_TEST
     known_device_test::process();
+#endif
+#if defined(ROGUE_RADAR_PERFORMANCE_TEST) && ROGUE_RADAR_PERFORMANCE_TEST
+    performanceDeviceTestProcess();
 #endif
 
     // Keyboard OK/Back safety: finish after LVGL event handling and after
@@ -16552,5 +16274,6 @@ void loop() {
     // GPIO0 is no longer watched in the background for long-hold shutdown.
 
 
+    reportRuntimeHealth(loopStartedUs);
     delay(5);
 }

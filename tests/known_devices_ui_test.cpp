@@ -14,12 +14,16 @@
 
 using namespace rogue_radar;
 
+namespace rogue_radar {
+enum class KnownRecordScanResult : uint8_t { Progress, Record, End, Error };
+struct KnownRecordScan { uint32_t cursor = 0; bool active = false; };
+}
+
 static uint32_t nowMs;
 static uint32_t millis() { return nowMs; }
 static int digitalRead(int) { return 1; }
 static void resetInactivityTimer() {}
 static void *ps_malloc(size_t size) { return std::malloc(size); }
-static void *ps_calloc(size_t count, size_t size) { return std::calloc(count, size); }
 
 struct EspStub { size_t getFreeHeap() const { return 256 * 1024; } } ESP;
 struct SerialStub { void println(const char *) {} } Serial;
@@ -60,6 +64,8 @@ static void loadScreenWithoutSlide(lv_obj_t *screen) { lv_screen_load(screen); }
 class FakeKnownDeviceStore {
  public:
     KnownDevice record{};
+    uint32_t scanBegins = 0;
+    uint32_t scanSteps = 0;
 
     KnownStoreStatus listPage(uint32_t cursor, KnownDeviceSummary out[6],
                               uint8_t &count, uint32_t &next) {
@@ -104,6 +110,31 @@ class FakeKnownDeviceStore {
             record.addresses[i - 1] = record.addresses[i];
         --record.addressCount;
         return KnownStoreStatus::Ok;
+    }
+    KnownStoreStatus beginRecordScan(KnownRecordScan &scan) {
+        ++scanBegins;
+        scan.cursor = 0;
+        scan.active = true;
+        return KnownStoreStatus::Ok;
+    }
+    KnownRecordScanResult scanRecordStep(KnownRecordScan &scan, KnownDevice &out,
+                                         KnownStoreStatus &status) {
+        ++scanSteps;
+        status = KnownStoreStatus::Ok;
+        if (!scan.active) {
+            status = KnownStoreStatus::InvalidArgument;
+            return KnownRecordScanResult::Error;
+        }
+        if (scan.cursor++ == 0 && record.id) {
+            out = record;
+            return KnownRecordScanResult::Record;
+        }
+        scan.active = false;
+        return KnownRecordScanResult::End;
+    }
+    void endRecordScan(KnownRecordScan &scan) {
+        scan.active = false;
+        scan.cursor = 0;
     }
 };
 
@@ -192,6 +223,34 @@ int main() {
     fakeStore.record.addressCount = 1;
     std::strcpy(fakeStore.record.addresses[0].address, "AA:BB:CC:DD:EE:01");
     fakeStore.record.addresses[0].addressType = 1;
+
+    // Paint-time queries only enqueue. One incremental store step resolves a
+    // hit, and generation-valid repeated paints perform no further I/O.
+    char cachedName[33]{};
+    assert(!knownUiIsSaved(KnownRadio::Ble, fakeStore.record.addresses[0],
+                           cachedName, sizeof(cachedName)));
+    assert(fakeStore.scanBegins == 0 && fakeStore.scanSteps == 0);
+    assert(processKnownUiSavedLookups());
+    assert(fakeStore.scanBegins == 1 && fakeStore.scanSteps == 1);
+    assert(knownUiIsSaved(KnownRadio::Ble, fakeStore.record.addresses[0],
+                          cachedName, sizeof(cachedName)));
+    assert(std::strcmp(cachedName, "My tag") == 0);
+    for (int i = 0; i < 100; ++i)
+        assert(knownUiIsSaved(KnownRadio::Ble, fakeStore.record.addresses[0],
+                              cachedName, sizeof(cachedName)));
+    assert(fakeStore.scanBegins == 1 && fakeStore.scanSteps == 1);
+
+    KnownAddress absent{};
+    std::strcpy(absent.address, "AA:BB:CC:DD:EE:99");
+    absent.addressType = 1;
+    assert(!knownUiIsSaved(KnownRadio::Ble, absent, cachedName, sizeof(cachedName)));
+    assert(fakeStore.scanBegins == 1 && fakeStore.scanSteps == 1);
+    assert(!processKnownUiSavedLookups());  // One record, no match yet.
+    assert(processKnownUiSavedLookups());   // End makes the negative authoritative.
+    const uint32_t settledSteps = fakeStore.scanSteps;
+    for (int i = 0; i < 100; ++i)
+        assert(!knownUiIsSaved(KnownRadio::Ble, absent, cachedName, sizeof(cachedName)));
+    assert(fakeStore.scanSteps == settledSteps);
 
     createSavedDevices();
     settleAndProcess();
